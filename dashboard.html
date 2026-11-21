@@ -64,6 +64,18 @@
   button:hover { border-color: var(--accent); }
   button:disabled { opacity: .5; cursor: default; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  input[type=text], input[type=password], input[type=number] {
+    width: 100%;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font: inherit;
+    margin-bottom: 8px;
+  }
+  input.small { width: 110px; margin-bottom: 0; }
+  button.stop { background: var(--bad); border-color: var(--bad); color: #fff; }
   textarea {
     width: 100%;
     background: var(--bg);
@@ -121,8 +133,8 @@
     </div>
     <div class="row">
       <span class="pill" id="state">…</span>
-      <button id="pause">Pause</button>
-      <button class="primary" id="run">Run now</button>
+      <button class="primary" id="toggle">Start</button>
+      <button id="run" style="display:none">Run now</button>
     </div>
   </header>
   <main>
@@ -140,9 +152,35 @@
     </section>
     <div class="grid">
       <section class="card">
+        <h2>Login</h2>
+        <p class="muted" id="loginstate">Not logged in.</p>
+        <form id="loginform" autocomplete="on">
+          <input type="text" id="user" name="username" placeholder="Username or email" autocomplete="username">
+          <input type="password" id="pass" name="password" placeholder="Password" autocomplete="current-password">
+          <div class="row">
+            <button class="primary" id="login" type="submit">Log in</button>
+            <span class="err" id="loginerr"></span>
+          </div>
+        </form>
+        <div class="row" style="margin-bottom:8px"><button id="logout" type="button" style="display:none">Log out</button></div>
+        <p class="muted">Your password is sent to the site once and is not saved. Only the session is kept. If it expires, log in again here.</p>
+      </section>
+      <section class="card">
+        <h2>Delay between downloads</h2>
+        <div class="row">
+          <input type="number" class="small" id="delay" min="0" max="1440" step="0.5">
+          <span class="muted">minutes</span>
+          <button class="primary" id="savedelay">Save</button>
+          <span class="err" id="delayerr"></span>
+        </div>
+        <p class="muted" id="countdown">Applies immediately, even while waiting. Raise it to be gentler on your account.</p>
+      </section>
+    </div>
+    <div class="grid">
+      <section class="card">
         <h2>Search query</h2>
         <textarea id="tags" rows="3" placeholder="artist:&quot;Aomushi&quot;"></textarea>
-        <p class="muted">Same syntax as the site. Exclusions for blocked tags are added automatically. After saving, press Run now to start.</p>
+        <p class="muted">Same syntax as the site. Exclusions for blocked tags are added automatically. After saving, press Start.</p>
         <div class="row">
           <button class="primary" id="save">Save query</button>
           <span class="err" id="tagerr"></span>
@@ -151,7 +189,7 @@
       <section class="card">
         <h2>Add a book</h2>
         <textarea id="want" rows="3" placeholder="https://hentainexus.com/view/22434"></textarea>
-        <p class="muted">Links or ids, one per line. Does not change the search query.</p>
+        <p class="muted">Links or ids, one per line. Downloads on its own, even while stopped (after the delay).</p>
         <div class="row">
           <button id="add">Queue</button>
           <span class="err" id="wanterr"></span>
@@ -173,8 +211,16 @@
 (function () {
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
-  var editing = { tags: false };
+  var editing = { tags: false, delay: false };
   var lastOk = 0;
+  var nextAt = 0;
+
+  function tick() {
+    if (!nextAt) return;
+    var left = Math.max(0, Math.round((nextAt - Date.now()) / 1000));
+    $("countdown").textContent = "Next download in " + Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0");
+  }
+  setInterval(tick, 1000);
 
   function api(path, body) {
     var opts = body === undefined
@@ -196,7 +242,7 @@
 
   function stateClass(s) {
     if (s === "downloading" || s === "searching" || s === "dry-run") return "ok";
-    if (s === "paused" || s === "idle" || s === "sleeping" || s === "starting") return "warn";
+    if (s === "waiting" || s === "idle" || s === "sleeping" || s === "starting") return "warn";
     if (s === "stopped") return "bad";
     return "";
   }
@@ -240,9 +286,23 @@
     $("searchbar").style.width = pct(s.searchPage, s.searchPages) + "%";
     $("dlbar").style.width = pct(s.downloadDone, s.downloadTotal) + "%";
 
-    $("pause").textContent = s.paused ? "Paused" : "Pause";
-    $("pause").disabled = !!s.paused;
-    $("run").textContent = s.paused ? "Resume / Run now" : "Run now";
+    var running = !!s.running;
+    $("toggle").textContent = running ? "Stop" : "Start";
+    $("toggle").className = running ? "stop" : "primary";
+    $("run").style.display = running ? "" : "none";
+
+    var lg = s.login || {};
+    $("loginstate").textContent = lg.loggedIn
+      ? "Logged in as " + lg.user + (lg.since ? " since " + new Date(lg.since).toLocaleString() : "") + "."
+      : (lg.expired ? "Session expired. Log in again." : "Not logged in.");
+    $("loginform").style.display = lg.loggedIn ? "none" : "";
+    $("logout").style.display = lg.loggedIn ? "" : "none";
+
+    if (document.activeElement !== $("delay") && !editing.delay) {
+      $("delay").value = Math.round((s.downloadDelaySec / 60) * 100) / 100;
+    }
+    nextAt = s.nextDownloadAt ? Date.parse(s.nextDownloadAt) : 0;
+    tick();
 
     if (!editing.tags && document.activeElement !== $("tags")) {
       $("tags").value = s.tagsInput || "";
@@ -263,15 +323,14 @@
 
     // Surface the failures people hit most, right at the top of the page.
     var recent = (s.log || []).slice(-40).reverse();
-    var login = recent.find(function (l) { return /ERROR/.test(l) && /LOGIN REQUIRED/.test(l); });
-    var blocked = recent.find(function (l) { return /ERROR/.test(l) && /(403|Cloudflare)/i.test(l); });
+        var blocked = recent.find(function (l) { return /ERROR/.test(l) && /(403|Cloudflare)/i.test(l); });
     var msgText = "";
-    if (s.cookieSet === false) {
-      msgText = "COOKIE is not set. Downloads need your logged-in session: set the COOKIE variable in the Unraid template (see README), then restart the container.";
-    } else if (login && s.failedThisCycle > 0) {
-      msgText = "Login required: the COOKIE is missing or has expired. Log in to hentainexus.com in a browser, copy the Cookie header, update the COOKIE variable and restart the container.";
+    if (!lg.loggedIn && lg.expired) {
+      msgText = "Your login expired. Log in again in the Login box below, then press Start.";
+    } else if (!lg.loggedIn) {
+      msgText = "Not logged in. Downloads need your HentaiNexus account: use the Login box below.";
     } else if (blocked && s.failedThisCycle > 0) {
-      msgText = "The site is blocking requests (403 / Cloudflare). Use a Cookie and User-Agent from a browser on the same network as the server.";
+      msgText = "The site is blocking requests (403 / Cloudflare). See the Log for details.";
     }
     if (msgText) {
       $("banner").textContent = msgText;
@@ -298,8 +357,38 @@
     });
   }
 
-  $("pause").addEventListener("click", function () { control("pause"); });
+  $("toggle").addEventListener("click", function () {
+    control($("toggle").textContent === "Stop" ? "stop" : "start");
+  });
   $("run").addEventListener("click", function () { control("run"); });
+
+  $("loginform").addEventListener("submit", function (e) {
+    e.preventDefault();
+    $("loginerr").textContent = "";
+    $("login").disabled = true;
+    $("login").textContent = "Logging in…";
+    api("/api/login", { username: $("user").value, password: $("pass").value }).then(function (s) {
+      $("pass").value = "";
+      render(s);
+    }).catch(function (err) {
+      $("loginerr").textContent = err.message;
+    }).then(function () {
+      $("login").disabled = false;
+      $("login").textContent = "Log in";
+    });
+  });
+  $("logout").addEventListener("click", function () {
+    api("/api/logout", {}).then(render).catch(function (err) { $("loginerr").textContent = err.message; });
+  });
+
+  $("delay").addEventListener("input", function () { editing.delay = true; });
+  $("savedelay").addEventListener("click", function () {
+    $("delayerr").textContent = "";
+    api("/api/settings", { delayMinutes: Number($("delay").value) }).then(function (s) {
+      editing.delay = false;
+      render(s);
+    }).catch(function (err) { $("delayerr").textContent = err.message; });
+  });
 
   $("tags").addEventListener("input", function () { editing.tags = true; });
 
@@ -309,7 +398,7 @@
       editing.tags = false;
       render(s);
       $("tagerr").textContent = "";
-      $("message").textContent = "Query saved. Press Run now to start.";
+      $("message").textContent = "Query saved. Press Start.";
     }).catch(function (err) { $("tagerr").textContent = err.message; });
   });
 

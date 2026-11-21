@@ -2,7 +2,7 @@
 /**
  * HentaiNexus CBZ archivist.
  * Search and /view/{id} pages give the metadata. The images come from the
- * site's own /zip/{id} download, using the logged-in session in COOKIE.
+ * site's own /zip/{id} download, using the login saved from the dashboard.
  * The zip is turned into a CBZ by adding ComicInfo.xml. Nothing from the
  * reader pages is decoded.
  */
@@ -10,7 +10,7 @@ import { createServer } from "node:http";
 import net from "node:net";
 import dns from "node:dns";
 import { timingSafeEqual } from "node:crypto";
-import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile, appendFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, readdir, rename, rm, stat, writeFile, appendFile } from "node:fs/promises";
 import { readFileSync, createWriteStream } from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -41,9 +41,7 @@ const cfg = {
   streakCap: Math.max(0, Number(process.env.CATCH_UP_STREAK) || 40),
   maxPerCycle: Math.max(0, Number(process.env.MAX_PER_CYCLE) || 10),
   maxPages: Math.max(0, Number(process.env.MAX_SEARCH_PAGES) || 0),
-  cookie: (process.env.COOKIE || "").replace(/^\s*cookie:\s*/i, "").trim(),
   zipTimeout: Math.max(60, Number(process.env.ZIP_TIMEOUT_SEC) || 900),
-  zipDelay: (process.env.ZIP_DELAY_MS ?? "") === "" ? 5000 : Math.max(0, Number(process.env.ZIP_DELAY_MS) || 0),
   importKey: process.env.LIBRARY_IMPORT_KEY || "",
   ua: process.env.USER_AGENT
     || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -71,7 +69,10 @@ const status = {
   currentId: null,
   currentTitle: "",
   message: "",
-  cookieSet: false,
+  running: false,
+  nextDownloadAt: null,
+  downloadDelaySec: 180,
+  login: { loggedIn: false, expired: false, user: "", since: null },
   tagsInput: "",
   tags: "",
   sleepUntil: null,
@@ -81,7 +82,13 @@ const status = {
 };
 
 let liveTags = (process.env.HN_TAGS || "").trim();
-let paused = false;
+// Nothing runs until the user presses Start in the dashboard.
+let paused = true;
+let queueArmed = false;
+let stopEpoch = 0; // bumped by Stop so waits for the delay can be cancelled
+let downloadDelaySec = 180;
+let lastDownloadEnd = 0;
+let loginBusy = false;
 let runNow = false;
 let shuttingDown = false;
 let wantQueue = [];
@@ -91,7 +98,6 @@ let sleepTimer = null;
 let sleepResolve = null;
 let lastHtmlAt = 0;
 
-status.cookieSet = !!cfg.cookie;
 const livePath = join(dirname(cfg.downloadme), "nexus.json");
 
 function flag(v) {
@@ -193,8 +199,16 @@ function pushEvent(type, data) {
   if (status.recent.length > 30) status.recent.length = 30;
 }
 
+function fmtDuration(ms) {
+  const sec = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+}
+
 function sync() {
   status.paused = paused;
+  status.running = !paused;
+  status.downloadDelaySec = downloadDelaySec;
+  status.login = { loggedIn: session.loggedIn, expired: session.expired, user: session.user, since: session.at };
   status.tagsInput = liveTags;
   status.tags = liveTags ? withSafety(liveTags) : "";
   status.wantQueue = [...wantQueue];
@@ -204,7 +218,7 @@ async function saveLive() {
   sync();
   try {
     await mkdir(dirname(livePath), { recursive: true });
-    await writeFile(livePath, JSON.stringify({ tags: liveTags, paused, wantQueue }, null, 2) + "\n");
+    await writeFile(livePath, JSON.stringify({ tags: liveTags, wantQueue, downloadDelaySec }, null, 2) + "\n");
   } catch (err) {
     log("warn", `could not save nexus.json: ${err instanceof Error ? err.message : err}`);
   }
@@ -214,7 +228,7 @@ function loadLive() {
   try {
     const j = JSON.parse(readFileSync(livePath, "utf8"));
     if (typeof j.tags === "string") liveTags = j.tags.trim();
-    if (typeof j.paused === "boolean") paused = j.paused;
+    if (typeof j.downloadDelaySec === "number" && j.downloadDelaySec >= 0 && j.downloadDelaySec <= 86400) downloadDelaySec = Math.round(j.downloadDelaySec);
     if (Array.isArray(j.wantQueue)) wantQueue = j.wantQueue.map(Number).filter((n) => Number.isInteger(n) && n > 0);
   } catch { /* first boot */ }
   sync();
@@ -246,13 +260,236 @@ async function throttleHtml() {
   lastHtmlAt = Date.now();
 }
 
+// ---- Login session. Stored in the config folder; the password is never stored.
+const sessionPath = join(dirname(cfg.downloadme), "session.json");
+const session = { loggedIn: false, expired: false, user: "", at: null, cookies: {} };
+let sessionSaveTimer = null;
+
+const LOGIN_HELP = "Log in again from the Login box on the dashboard.";
+
+function loadSession() {
+  try {
+    const j = JSON.parse(readFileSync(sessionPath, "utf8"));
+    if (j && j.cookies && typeof j.cookies === "object") {
+      session.cookies = Object.fromEntries(Object.entries(j.cookies).filter(([, v]) => typeof v === "string"));
+      session.user = typeof j.user === "string" ? j.user : "";
+      session.at = typeof j.at === "string" ? j.at : null;
+      session.loggedIn = j.loggedIn === true && Object.keys(session.cookies).length > 0;
+      session.expired = j.expired === true && !session.loggedIn;
+    }
+  } catch { /* no session saved yet */ }
+}
+
+async function saveSession() {
+  try {
+    await mkdir(dirname(sessionPath), { recursive: true });
+    await writeFile(sessionPath, JSON.stringify(session, null, 2) + "\n", { mode: 0o600 });
+    await chmod(sessionPath, 0o600).catch(() => {});
+  } catch (err) {
+    log("warn", `could not save session.json: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+function jarHeader(jar) {
+  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+function absorbInto(jar, res) {
+  const list = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+  let changed = false;
+  for (const sc of list) {
+    const first = sc.split(";")[0];
+    const i = first.indexOf("=");
+    if (i < 1) continue;
+    const name = first.slice(0, i).trim();
+    const val = first.slice(i + 1).trim();
+    const gone = val === "" || /;\s*max-age=0\b/i.test(sc) || /;\s*expires=[^;]*1970/i.test(sc);
+    if (gone) {
+      if (name in jar) { delete jar[name]; changed = true; }
+    } else if (jar[name] !== val) {
+      jar[name] = val;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+// Keep the saved session fresh when the site rotates its cookies.
+function absorbSession(res) {
+  if (!session.loggedIn) return;
+  if (absorbInto(session.cookies, res)) {
+    clearTimeout(sessionSaveTimer);
+    sessionSaveTimer = setTimeout(() => { saveSession(); }, 1000);
+  }
+}
+
+function expireSession(reason) {
+  if (!session.loggedIn) return;
+  session.loggedIn = false;
+  session.expired = true;
+  log("warn", `Session expired (${reason}). Log in again from the dashboard.`);
+  saveSession();
+}
+
+const LOGIN_PATHS = ["/login", "/account/login", "/user/login", "/users/login", "/signin", "/sign-in", "/auth/login"];
+const CAPTCHA_IN_FORM = /g-recaptcha|h-captcha|cf-turnstile|data-sitekey|recaptcha|hcaptcha|turnstile/i;
+const CAPTCHA_WIDGET = /class="[^"]*(?:g-recaptcha|h-captcha|cf-turnstile)/i;
+
+function unescapeAttr(v) {
+  return String(v).replace(/&quot;/g, '"').replace(/&#0*39;|&#x27;|&apos;/gi, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
+function parseAttrs(str) {
+  const out = {};
+  for (const m of str.matchAll(/([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g)) {
+    out[m[1].toLowerCase()] = unescapeAttr(m[2] ?? m[3] ?? m[4] ?? "");
+  }
+  return out;
+}
+
+function parseForms(html) {
+  const forms = [];
+  for (const m of html.matchAll(/<form\b([^>]*)>([\s\S]*?)<\/form>/gi)) {
+    forms.push({
+      attrs: parseAttrs(m[1]),
+      inputs: [...m[2].matchAll(/<input\b([^>]*)>/gi)].map((x) => parseAttrs(x[1])),
+      html: m[0],
+    });
+  }
+  return forms;
+}
+
+const hasPassword = (form) => form.inputs.some((i) => (i.type || "").toLowerCase() === "password");
+
+function loginError(html) {
+  const m = html.match(/<(?:div|p|span|li|article)\b[^>]*class="[^"]*(?:error|danger|alert|invalid|notification|flash)[^"]*"[^>]*>([\s\S]*?)<\/(?:div|p|span|li|article)>/i);
+  return m ? decode(m[1]).slice(0, 160) : "";
+}
+
+// GET/POST with a cookie jar, following redirects by hand, same site only.
+async function jarFetch(jar, url, { method = "GET", body, referer } = {}) {
+  const site = new URL(ORIGIN).origin;
+  let cur = url;
+  let ref = referer || `${ORIGIN}/`;
+  for (let hop = 0; hop < 7; hop++) {
+    if (new URL(cur).origin !== site) throw new Error(`the site redirected to another address (${new URL(cur).host}); not following it`);
+    const headers = { "User-Agent": cfg.ua, Accept: "text/html,application/xhtml+xml", Referer: ref };
+    const ck = jarHeader(jar);
+    if (ck) headers.Cookie = ck;
+    if (body) {
+      headers["Content-Type"] = "application/x-www-form-urlencoded";
+      headers.Origin = site;
+    }
+    await throttleHtml();
+    let res;
+    try {
+      res = await fetch(cur, { method, headers, body, redirect: "manual", signal: AbortSignal.timeout(30_000) });
+    } catch (err) {
+      throw new Error(`${describeError(err)} (${cur})`);
+    }
+    absorbInto(jar, res);
+    const loc = res.headers.get("location");
+    if ([301, 302, 303, 307, 308].includes(res.status) && loc) {
+      await res.body?.cancel().catch(() => {});
+      ref = cur;
+      cur = new URL(loc, cur).toString();
+      if (res.status !== 307 && res.status !== 308) { method = "GET"; body = undefined; }
+      continue;
+    }
+    return { status: res.status, text: await res.text(), url: cur };
+  }
+  throw new Error("too many redirects");
+}
+
+async function siteLogin(username, password) {
+  const jar = {};
+  const tried = [];
+  let found = null;
+
+  const home = await jarFetch(jar, `${ORIGIN}/`);
+  const inline = parseForms(home.text).find(hasPassword);
+  if (inline) found = { page: home, form: inline };
+  if (!found) {
+    const candidates = [];
+    for (const m of home.text.matchAll(/href="([^"#]*(?:log-?in|sign-?in)[^"#]*)"/gi)) {
+      try { candidates.push(new URL(unescapeAttr(m[1]), ORIGIN).toString()); } catch { /* skip */ }
+    }
+    for (const path of LOGIN_PATHS) candidates.push(`${ORIGIN}${path}`);
+    for (const u of [...new Set(candidates)].slice(0, 8)) {
+      const where = new URL(u).pathname;
+      try {
+        const r = await jarFetch(jar, u);
+        tried.push(`${where} ${r.status}`);
+        const form = r.status < 400 ? parseForms(r.text).find(hasPassword) : null;
+        if (form) { found = { page: r, form }; break; }
+      } catch (err) {
+        tried.push(`${where} ${describeError(err).slice(0, 60)}`);
+      }
+    }
+  }
+  if (!found) throw new Error(`LOGIN FAILED: could not find the site's login form (tried ${tried.join(", ") || "nothing"}).`);
+
+  const form = found.form;
+  if (CAPTCHA_IN_FORM.test(form.html) || CAPTCHA_WIDGET.test(found.page.text)) {
+    throw new Error("LOGIN BLOCKED: the site's login form has a CAPTCHA, which the archivist cannot complete.");
+  }
+  const method = (form.attrs.method || "GET").toUpperCase();
+  if (method !== "POST") throw new Error("LOGIN BLOCKED: the login form does not use POST, so it was not used (the password would end up in the address).");
+  const action = new URL(form.attrs.action || found.page.url, found.page.url);
+  if (action.origin !== new URL(ORIGIN).origin) {
+    throw new Error(`LOGIN BLOCKED: the login form sends the password to another site (${action.host}), so it was not used.`);
+  }
+
+  const textInputs = form.inputs.filter((i) => i.name && ["text", "email"].includes((i.type || "text").toLowerCase()));
+  const userField = (textInputs.find((i) => /user|e-?mail|login|account|name|id/i.test(i.name)) || textInputs[0])?.name;
+  if (!userField) throw new Error("LOGIN FAILED: could not find the username field on the login form.");
+  const fields = [];
+  let passDone = false;
+  let submitDone = false;
+  for (const inp of form.inputs) {
+    if (!inp.name) continue;
+    const type = (inp.type || "text").toLowerCase();
+    if (type === "password") {
+      if (!passDone) { fields.push([inp.name, password]); passDone = true; }
+    } else if (inp.name === userField && ["text", "email"].includes(type)) {
+      fields.push([inp.name, username]);
+    } else if (type === "hidden") {
+      fields.push([inp.name, inp.value ?? ""]);
+    } else if (type === "checkbox") {
+      if (/remember|stay|keep|persist/i.test(inp.name)) fields.push([inp.name, inp.value || "on"]);
+    } else if (type === "submit" && !submitDone) {
+      fields.push([inp.name, inp.value ?? ""]);
+      submitDone = true;
+    }
+  }
+
+  const r = await jarFetch(jar, action.toString(), { method: "POST", body: new URLSearchParams(fields).toString(), referer: found.page.url });
+  if (r.status === 403 || r.status === 429) throw new Error(`LOGIN FAILED: the site answered ${r.status} to the login. It may be blocking automated logins.`);
+  if (r.status >= 400) throw new Error(`LOGIN FAILED: HTTP ${r.status} from the login page.`);
+  if (parseForms(r.text).some(hasPassword)) {
+    const why = loginError(r.text);
+    throw new Error(`LOGIN FAILED: the site showed the login form again${why ? ` ("${why}")` : ""}. Check the username and password.`);
+  }
+
+  session.cookies = jar;
+  session.user = username;
+  session.at = new Date().toISOString();
+  session.loggedIn = true;
+  session.expired = false;
+  await saveSession();
+  log("info", `Logged in as ${username} (cookies: ${Object.keys(jar).join(", ") || "none"})`);
+}
+
 async function http(url, { referer } = {}) {
   const headers = {
     "User-Agent": cfg.ua,
     Accept: "text/html",
     Referer: referer || `${ORIGIN}/`,
   };
-  if (cfg.cookie) headers.Cookie = cfg.cookie;
+  if (session.loggedIn) {
+    const ck = jarHeader(session.cookies);
+    if (ck) headers.Cookie = ck;
+  }
   let last = "no response";
   for (let i = 0; i < 5; i++) {
     await throttleHtml();
@@ -269,6 +506,7 @@ async function http(url, { referer } = {}) {
       }
       throw new Error(`${last} (${url})`);
     }
+    absorbSession(res);
     if (res.status === 429 || res.status === 503 || res.status === 502) {
       const pause = Math.min(120_000, 4000 * 2 ** i);
       log("warn", `${res.status} ${url} — waiting ${Math.round(pause / 1000)}s`);
@@ -276,11 +514,11 @@ async function http(url, { referer } = {}) {
       last = String(res.status);
       continue;
     }
-    if (res.status === 403) throw new Error(`403 from ${url}. If this is Cloudflare, set COOKIE from a browser that can open the site, and set USER_AGENT to the same browser User-Agent.`);
+    if (res.status === 403) throw new Error(`403 from ${url}. The site is refusing requests from this server (bot protection or a block).`);
     if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
     const text = await res.text();
     if (/Just a moment|cf-browser-verification|challenge-platform/i.test(text)) {
-      throw new Error("Cloudflare challenge. Set COOKIE from a browser that can open the site.");
+      throw new Error("Cloudflare is showing a challenge page to this server, which the archivist cannot pass.");
     }
     return text;
   }
@@ -400,15 +638,16 @@ async function exists(path) {
   try { await stat(path); return true; } catch { return false; }
 }
 
-const LOGIN_HELP = `Log in at ${ORIGIN} in your browser, copy the Cookie header of a request to the site, and put it in the COOKIE variable of the Unraid template.`;
-
 async function httpFile(url, dest, { referer } = {}) {
   const headers = {
     "User-Agent": cfg.ua,
     Accept: "application/zip,application/octet-stream,*/*;q=0.8",
     Referer: referer || `${ORIGIN}/`,
   };
-  if (cfg.cookie) headers.Cookie = cfg.cookie;
+  if (session.loggedIn) {
+    const ck = jarHeader(session.cookies);
+    if (ck) headers.Cookie = ck;
+  }
   let last = "no response";
   for (let i = 0; i < 4; i++) {
     await throttleHtml();
@@ -427,6 +666,7 @@ async function httpFile(url, dest, { referer } = {}) {
       }
       throw new Error(`${last} (${url})`);
     }
+    absorbSession(res);
     if (res.status === 429 || res.status === 503 || res.status === 502) {
       const pause = Math.min(120_000, 4000 * 2 ** i);
       log("warn", `${res.status} ${url} - waiting ${Math.round(pause / 1000)}s`);
@@ -436,16 +676,16 @@ async function httpFile(url, dest, { referer } = {}) {
     }
     if (res.status === 401 || res.status === 403) {
       await res.body?.cancel().catch(() => {});
-      throw new Error(`LOGIN REQUIRED: ${res.status} from ${url}. Your session may have expired, or Cloudflare is blocking the request (then also set USER_AGENT to the same browser). ${LOGIN_HELP}`);
+      throw new Error(`LOGIN REQUIRED: ${res.status} from ${url}. Your login may have expired, or the site is blocking this server. ${LOGIN_HELP}`);
     }
     if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
     const type = (res.headers.get("content-type") || "").toLowerCase();
     if (type.includes("text/html") || type.includes("json")) {
       const body = (await res.text()).slice(0, 4000);
       if (/Just a moment|cf-browser-verification|challenge-platform/i.test(body)) {
-        throw new Error("Cloudflare challenge on the zip download. Set COOKIE (and USER_AGENT) from a browser that can open the site.");
+        throw new Error("Cloudflare is showing a challenge page for the zip download, which the archivist cannot pass.");
       }
-      throw new Error(`LOGIN REQUIRED: the site returned a web page instead of a zip, so the COOKIE is missing or expired. ${LOGIN_HELP}`);
+      throw new Error(`LOGIN REQUIRED: the site returned a web page instead of a zip, so your login has expired. ${LOGIN_HELP}`);
     }
     status.downloadTotal = Number(res.headers.get("content-length")) || 0;
     try {
@@ -590,15 +830,36 @@ async function addComicInfo(path, makeXml) {
   }
 }
 
-async function downloadGallery(id, have) {
+class Cancelled extends Error {}
+
+// Wait until the gap since the last download has passed. The gap is read again
+// every half second, so changing it in the dashboard applies immediately.
+async function waitForDelay(cancelled) {
+  try {
+    for (;;) {
+      const due = lastDownloadEnd + downloadDelaySec * 1000;
+      const left = due - Date.now();
+      if (left <= 0) return;
+      if (shuttingDown || cancelled()) throw new Cancelled("cancelled");
+      status.state = "waiting";
+      status.nextDownloadAt = new Date(due).toISOString();
+      status.message = `Next download in ${fmtDuration(left)}`;
+      await wait(Math.min(500, left));
+    }
+  } finally {
+    status.nextDownloadAt = null;
+  }
+}
+
+async function downloadGallery(id, have, opts = {}) {
   status.state = cfg.dry ? "dry-run" : "downloading";
   status.currentId = id;
   status.currentTitle = "";
   status.downloadDone = 0;
   status.downloadTotal = 0;
   status.message = `Gallery ${id}`;
-  if (!cfg.dry && !cfg.cookie) {
-    throw new Error(`LOGIN REQUIRED: COOKIE is not set. ${LOGIN_HELP}`);
+  if (!cfg.dry && !session.loggedIn) {
+    throw new Error(`LOGIN REQUIRED: ${session.expired ? "the login has expired" : "you are not logged in"}. ${LOGIN_HELP}`);
   }
   const view = await http(`${ORIGIN}/view/${id}`);
   const g = parseGallery(view, id);
@@ -632,8 +893,15 @@ async function downloadGallery(id, have) {
   await mkdir(tmp, { recursive: true });
   try {
     const zipPath = join(tmp, `${id}.zip`);
+    const epoch = stopEpoch;
+    await waitForDelay(() => stopEpoch !== epoch || (!opts.queued && paused && !runNow));
+    status.state = "downloading";
     status.message = `Downloading zip for #${id}`;
-    await httpFile(`${ORIGIN}/zip/${id}`, zipPath, { referer: `${ORIGIN}/view/${id}` });
+    try {
+      await httpFile(`${ORIGIN}/zip/${id}`, zipPath, { referer: `${ORIGIN}/view/${id}` });
+    } finally {
+      lastDownloadEnd = Date.now();
+    }
     const pages = await addComicInfo(zipPath, (count) => comicInfo({ ...g, pages: count }));
     await rename(zipPath, dest);
     have.add(id);
@@ -641,22 +909,28 @@ async function downloadGallery(id, have) {
     status.addedThisCycle += 1;
     log("info", `Wrote ${dest} (${pages} pages)`);
     pushEvent("wrote", { id, title: filename, pages });
-    if (cfg.zipDelay) await wait(cfg.zipDelay);
     return "wrote";
   } finally {
     if (cfg.cleanup) await rm(tmp, { recursive: true, force: true });
   }
 }
 
-async function takeOne(id, have, skip) {
+async function takeOne(id, have, skip, opts = {}) {
   try {
     if (skip.has(id)) return "blacklisted";
     if (have.has(id)) return "have";
-    return await downloadGallery(id, have);
+    return await downloadGallery(id, have, opts);
   } catch (err) {
+    if (err instanceof Cancelled) {
+      status.message = "Stopped";
+      return "cancelled";
+    }
     status.failedThisCycle += 1;
     const title = describeError(err);
-    if (/^LOGIN REQUIRED/.test(title)) authFailed = true;
+    if (/^LOGIN REQUIRED/.test(title)) {
+      authFailed = true;
+      expireSession("the site did not accept the saved login");
+    }
     log("error", `#${id} ${title}`);
     pushEvent("error", { id, title });
     return "failed";
@@ -670,10 +944,14 @@ async function drainWant(have, skip) {
     while (wantQueue.length && !shuttingDown) {
       const id = wantQueue[0];
       log("info", `One-off #${id}`);
-      await takeOne(id, have, skip);
+      const outcome = await takeOne(id, have, skip, { queued: true });
+      if (outcome === "cancelled") {
+        log("info", `Stopped before #${id}; it stays queued. Press Start to resume.`);
+        break;
+      }
       wantQueue.shift();
       if (authFailed && wantQueue.length) {
-        log("warn", `Login required: dropped ${wantQueue.length} more queued book(s). Fix COOKIE and queue them again.`);
+        log("warn", `Login required: dropped ${wantQueue.length} more queued book(s). Log in again from the dashboard and queue them again.`);
         wantQueue.length = 0;
       }
       status.wantQueue = [...wantQueue];
@@ -758,8 +1036,8 @@ async function runCycle() {
   }
   if (liveTags && !shuttingDown && !(paused && !runNow)) await searchCycle(have, skip);
   if (!liveTags && !listed.length && !wantQueue.length) {
-    status.state = "idle";
-    status.message = "No query yet. Set one below, or paste a gallery link.";
+    status.state = "stopped";
+    status.message = "No search query yet. Set one, then press Start.";
     paused = true;
   }
   status.currentId = null;
@@ -828,9 +1106,22 @@ function startServer(port) {
     if (url.pathname === "/api/control" && req.method === "POST") {
       readBody(req).then(async (body) => {
         const action = String(body.action || "");
-        if (action === "pause") { paused = true; log("info", "Pause requested"); }
-        else if (action === "run") { paused = false; runNow = true; log("info", "Run now"); wake(); }
-        else return json(res, 400, { error: "action must be pause or run" });
+        if (action === "stop" || action === "pause") {
+          paused = true;
+          runNow = false;
+          queueArmed = false;
+          stopEpoch++;
+          status.sleepUntil = null;
+          log("info", "Stop requested (a download in progress will finish)");
+          wake();
+        } else if (action === "start" || action === "run") {
+          if (!session.loggedIn && !cfg.dry) return json(res, 400, { error: "Log in first, then press Start." });
+          paused = false;
+          runNow = true;
+          queueArmed = true;
+          log("info", action === "start" ? "Start" : "Run now");
+          wake();
+        } else return json(res, 400, { error: "action must be start or stop" });
         await saveLive();
         json(res, 200, snapshot());
       }).catch((err) => json(res, 400, { error: err.message }));
@@ -847,12 +1138,67 @@ function startServer(port) {
       }).catch((err) => json(res, 400, { error: err.message }));
       return;
     }
+    if (url.pathname === "/api/login" && req.method === "POST") {
+      readBody(req).then(async (body) => {
+        const username = String(body.username ?? "").trim();
+        const password = String(body.password ?? "");
+        if (!username || !password) return json(res, 400, { error: "Enter your username and password." });
+        if (username.length > 200 || password.length > 500) return json(res, 400, { error: "Username or password is too long." });
+        if (loginBusy) return json(res, 409, { error: "A login is already in progress." });
+        loginBusy = true;
+        try {
+          log("info", `Logging in as ${username}`);
+          await siteLogin(username, password);
+          authFailed = false;
+          json(res, 200, snapshot());
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          log("error", message);
+          json(res, 400, { error: message });
+        } finally {
+          loginBusy = false;
+        }
+      }).catch((err) => json(res, 400, { error: err.message }));
+      return;
+    }
+    if (url.pathname === "/api/logout" && req.method === "POST") {
+      req.resume();
+      paused = true;
+      runNow = false;
+      queueArmed = false;
+      stopEpoch++;
+      status.sleepUntil = null;
+      session.loggedIn = false;
+      session.expired = false;
+      session.user = "";
+      session.at = null;
+      session.cookies = {};
+      saveSession().then(() => {
+        log("info", "Logged out");
+        wake();
+        json(res, 200, snapshot());
+      });
+      return;
+    }
+    if (url.pathname === "/api/settings" && req.method === "POST") {
+      readBody(req).then(async (body) => {
+        const minutes = Number(body.delayMinutes);
+        if (!Number.isFinite(minutes) || minutes < 0 || minutes > 1440) return json(res, 400, { error: "Enter a delay between 0 and 1440 minutes." });
+        downloadDelaySec = Math.round(minutes * 60);
+        log("info", `Delay between downloads set to ${fmtDuration(downloadDelaySec * 1000)}`);
+        await saveLive();
+        json(res, 200, snapshot());
+      }).catch((err) => json(res, 400, { error: err.message }));
+      return;
+    }
     if (url.pathname === "/api/want" && req.method === "POST") {
       readBody(req).then(async (body) => {
+        if (!session.loggedIn && !cfg.dry) return json(res, 400, { error: "Log in first." });
         const ids = parseWant(body.text);
         if (!ids.length) return json(res, 400, { error: "Paste a hentainexus.com/view/… link or an id" });
         for (const id of ids) if (!wantQueue.includes(id) && wantQueue.length < 500) wantQueue.push(id);
         log("info", `Queued ${ids.join(", ")}`);
+        queueArmed = true;
         await saveLive();
         wake();
         json(res, 200, snapshot());
@@ -862,9 +1208,11 @@ function startServer(port) {
     if (url.pathname === "/api/import" && req.method === "POST") {
       if (!authorized(req.headers["x-api-key"])) { req.resume(); return json(res, 401, { ok: false, error: "unauthorized" }); }
       readBody(req).then(async (body) => {
+        if (!session.loggedIn && !cfg.dry) return json(res, 409, { ok: false, error: "not logged in" });
         const ids = parseWant(body.url || body.id || "");
         if (ids.length !== 1) return json(res, 400, { ok: false, error: "bad request" });
         if (!wantQueue.includes(ids[0])) wantQueue.push(ids[0]);
+        queueArmed = true;
         await saveLive();
         wake();
         json(res, 202, { ok: true, status: "queued", id: String(ids[0]) });
@@ -893,7 +1241,7 @@ async function drainOnly() {
 // Sleep until the next cycle is due, but handle queued books as soon as they
 // arrive, and return straight away when "Run now" is pressed.
 async function sleepUntilDue() {
-  while (!shuttingDown && !runNow) {
+  while (!shuttingDown && !runNow && !paused) {
     const left = status.sleepUntil ? Date.parse(status.sleepUntil) - Date.now() : 0;
     if (left <= 500) break;
     status.state = "sleeping";
@@ -910,28 +1258,50 @@ async function main() {
   await mkdir("/app/log", { recursive: true }).catch(() => {});
   await mkdir(dirname(cfg.downloadme), { recursive: true }).catch(() => {});
   loadLive();
+  loadSession();
   if (cfg.port) startServer(cfg.port);
   log("info", `Nexus archivist ${VERSION}. library=${cfg.library} delay=${cfg.delay}ms query=${status.tags || "(none)"}`);
-  log("info", `cookie=${cfg.cookie ? "set" : "not set"} user-agent=${process.env.USER_AGENT ? "custom" : "default"}`);
-  if (!cfg.cookie) log("warn", `COOKIE is not set. Downloads need a logged-in session. ${LOGIN_HELP}`);
+  log("info", `login=${session.loggedIn ? `saved session for ${session.user}` : session.expired ? "expired" : "not logged in"} download-delay=${fmtDuration(downloadDelaySec * 1000)} user-agent=${process.env.USER_AGENT ? "custom" : "default"}`);
+  log("info", "Stopped. Log in, set a search query, then press Start.");
+  status.message = "Stopped. Log in, set a search query, then press Start.";
   for (;;) {
     if (shuttingDown) break;
-    while (paused && !runNow && !wantQueue.length && !shuttingDown) {
-      status.state = "paused";
-      status.message = status.message || "Paused";
-      await wait(400);
+    if (paused && !runNow) {
+      // Stopped: only books the user queued by hand are downloaded.
+      if (wantQueue.length && queueArmed) {
+        try {
+          await drainOnly();
+        } catch (err) {
+          log("error", describeError(err));
+          wantQueue.length = 0;
+          await saveLive();
+        }
+        if (paused) { status.state = "stopped"; status.message = "Stopped."; }
+        continue;
+      }
+      if (status.state !== "stopped") {
+        status.state = "stopped";
+        status.message = "Stopped. Press Start to begin.";
+      }
+      await wait(300);
+      continue;
     }
-    if (shuttingDown) break;
     if (!runNow && status.sleepUntil && Date.parse(status.sleepUntil) - Date.now() > 500) {
       await sleepUntilDue();
       continue;
     }
-    const forced = runNow;
     runNow = false;
     try { await runCycle(); } catch (err) { log("error", describeError(err)); }
     if (cfg.once || shuttingDown) break;
-    if (paused && !forced) continue;
-    if (runNow) continue;
+    if (authFailed) {
+      paused = true;
+      queueArmed = false;
+      status.state = "stopped";
+      status.message = "Stopped: not logged in or the login expired. Log in, then press Start.";
+      log("warn", status.message);
+      continue;
+    }
+    if (paused || runNow) continue;
     if (!liveTags && !wantQueue.length) continue;
     const until = new Date(Date.now() + cfg.sleep * 1000);
     status.sleepUntil = until.toISOString();
