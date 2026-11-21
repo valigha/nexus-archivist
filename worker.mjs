@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.2.1";
+const VERSION = "1.2.2";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -148,6 +148,7 @@ const NET_HINTS = {
 /** Turn Node's opaque "fetch failed" into the real reason plus a hint. */
 function describeError(err) {
   if (!(err instanceof Error)) return String(err);
+  if (err.detail) return err.detail;
   const cause = err.cause;
   if (!cause) return err.name === "TimeoutError" ? "request timed out" : err.message;
   const first = Array.isArray(cause.errors) ? cause.errors[0] : null;
@@ -649,16 +650,56 @@ async function exists(path) {
   try { await stat(path); return true; } catch { return false; }
 }
 
+// The zip link redirects to a download host (for example downloads.<site>). Follow
+// it by hand so the login cookie goes to the site's own subdomains, as a browser
+// would, and never to any other site. Fail fast if a host does not answer.
+const HEADER_WAIT_MS = 60_000;
+async function fetchFollow(url, baseHeaders, cookie) {
+  const siteHost = new URL(ORIGIN).hostname;
+  let cur = url;
+  for (let hop = 0; hop < 6; hop++) {
+    const u = new URL(cur);
+    const headers = { ...baseHeaders };
+    delete headers.Cookie;
+    if (cookie && (u.hostname === siteHost || u.hostname.endsWith(`.${siteHost}`))) headers.Cookie = cookie;
+    const ctl = new AbortController();
+    let slow = false;
+    const timer = setTimeout(() => { slow = true; ctl.abort(); }, HEADER_WAIT_MS);
+    let res;
+    try {
+      res = await fetch(cur, { headers, redirect: "manual", signal: AbortSignal.any([ctl.signal, AbortSignal.timeout(cfg.zipTimeout * 1000)]) });
+    } catch (err) {
+      if (slow) {
+        const e = new Error("no response");
+        e.name = "TimeoutError";
+        e.detail = `${u.host} did not answer within ${HEADER_WAIT_MS / 1000}s`;
+        throw e;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+    const loc = res.headers.get("location");
+    if ([301, 302, 303, 307, 308].includes(res.status) && loc) {
+      await res.body?.cancel().catch(() => {});
+      const next = new URL(loc, cur);
+      if (next.protocol !== u.protocol && next.protocol !== "https:") throw new Error(`refusing a redirect to ${next.protocol}//${next.host}`);
+      if (next.host !== u.host) log("info", `Download is served from ${next.host}`);
+      cur = next.toString();
+      continue;
+    }
+    return res;
+  }
+  throw new Error("too many redirects");
+}
+
 async function httpFile(url, dest, { referer } = {}) {
   const headers = {
     "User-Agent": cfg.ua,
     Accept: "application/zip,application/octet-stream,*/*;q=0.8",
     Referer: referer || `${ORIGIN}/`,
   };
-  if (session.loggedIn) {
-    const ck = jarHeader(session.cookies);
-    if (ck) headers.Cookie = ck;
-  }
+  const cookie = session.loggedIn ? jarHeader(session.cookies) : "";
   let last = "no response";
   for (let i = 0; i < 4; i++) {
     await throttleHtml();
@@ -666,7 +707,7 @@ async function httpFile(url, dest, { referer } = {}) {
     status.downloadTotal = 0;
     let res;
     try {
-      res = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(cfg.zipTimeout * 1000) });
+      res = await fetchFollow(url, headers, cookie);
     } catch (err) {
       last = describeError(err);
       if (isTransient(err) && i < 3) {
