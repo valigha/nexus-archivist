@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.2.4";
+const VERSION = "1.2.5";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -42,6 +42,7 @@ const cfg = {
   maxPerCycle: Math.max(0, Number(process.env.MAX_PER_CYCLE) || 10),
   maxPages: Math.max(0, Number(process.env.MAX_SEARCH_PAGES) || 0),
   zipTimeout: Math.max(60, Number(process.env.ZIP_TIMEOUT_SEC) || 900),
+  cooldown: Math.max(1, Number(process.env.ZIP_COOLDOWN_SEC) || 120),
   stall: Math.max(2, Number(process.env.ZIP_STALL_SEC) || 30),
   importKey: process.env.LIBRARY_IMPORT_KEY || "",
   ua: process.env.USER_AGENT
@@ -86,6 +87,7 @@ let liveTags = (process.env.HN_TAGS || "").trim();
 // Nothing runs until the user presses Start in the dashboard.
 let paused = true;
 let queueArmed = false;
+let stopCtl = new AbortController(); // aborted by Stop so a running download ends at once
 let stopEpoch = 0; // bumped by Stop so waits for the delay can be cancelled
 let downloadDelaySec = 180;
 let lastDownloadEnd = 0;
@@ -655,7 +657,7 @@ async function exists(path) {
 // it by hand so the login cookie goes to the site's own subdomains, as a browser
 // would, and never to any other site. Fail fast if a host does not answer.
 const HEADER_WAIT_MS = 60_000;
-async function fetchFollow(url, baseHeaders, cookie) {
+async function fetchFollow(url, baseHeaders, cookie, stopSignal) {
   const siteHost = new URL(ORIGIN).hostname;
   let cur = url;
   for (let hop = 0; hop < 6; hop++) {
@@ -668,7 +670,7 @@ async function fetchFollow(url, baseHeaders, cookie) {
     const timer = setTimeout(() => { slow = true; ctl.abort(); }, HEADER_WAIT_MS);
     let res;
     try {
-      res = await fetch(cur, { headers, redirect: "manual", signal: AbortSignal.any([ctl.signal, AbortSignal.timeout(cfg.zipTimeout * 1000)]) });
+      res = await fetch(cur, { headers, redirect: "manual", signal: AbortSignal.any([ctl.signal, stopSignal, AbortSignal.timeout(cfg.zipTimeout * 1000)]) });
     } catch (err) {
       if (slow) {
         const e = new Error("no response");
@@ -701,6 +703,22 @@ async function httpFile(url, dest, { referer } = {}) {
     Referer: referer || `${ORIGIN}/`,
   };
   const cookie = session.loggedIn ? jarHeader(session.cookies) : "";
+  const myStop = stopEpoch;
+  const stopSignal = stopCtl.signal;
+  const stopped = () => stopEpoch !== myStop || shuttingDown;
+  // Sleep that Stop can cut short.
+  const nap = async (ms) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (stopped()) throw new Cancelled("cancelled");
+      await wait(Math.min(500, end - Date.now()));
+    }
+  };
+  // The host throttles for a while after a stalled or unanswered attempt, so a
+  // quick retry just stalls again. Wait progressively longer in that case.
+  let quietCount = 0;
+  const QUIET_PAUSES = [1, 2.5, 5].map((k) => k * cfg.cooldown * 1000);
+  const quietPause = () => QUIET_PAUSES[Math.min(quietCount++, QUIET_PAUSES.length - 1)];
   const MB = (n) => `${(n / 1048576).toFixed(1)} MB`;
   let last = "no response";
   let fails = 0; // attempts that made no progress; resuming attempts do not count
@@ -719,7 +737,7 @@ async function httpFile(url, dest, { referer } = {}) {
   };
 
   for (;;) {
-    if (shuttingDown) throw new Error("shutting down");
+    if (stopped()) throw new Cancelled("cancelled");
     await throttleHtml();
     const headers = { ...baseHeaders };
     if (got > 0) {
@@ -728,14 +746,16 @@ async function httpFile(url, dest, { referer } = {}) {
     }
     let res;
     try {
-      res = await fetchFollow(url, headers, cookie);
+      res = await fetchFollow(url, headers, cookie, stopSignal);
     } catch (err) {
+      if (stopped()) throw new Cancelled("cancelled");
       last = describeError(err);
       if (isTransient(err) && fails < 4) {
         fails++;
-        const pause = Math.min(60_000, 3000 * 2 ** (fails - 1));
-        log("warn", `${last} (${url}) - retrying in ${Math.round(pause / 1000)}s`);
-        await wait(pause);
+        const silent = err.name === "TimeoutError";
+        const pause = silent ? quietPause() : Math.min(60_000, 3000 * 2 ** (fails - 1));
+        log("warn", `${last} (${url}) - trying again in ${fmtDuration(pause)}${silent ? " (the site throttles right after a failed attempt, so this waits longer)" : ""}`);
+        await nap(pause);
         continue;
       }
       throw new Error(`${last} (${url})`);
@@ -746,7 +766,7 @@ async function httpFile(url, dest, { referer } = {}) {
       if (fail(String(res.status))) throw new Error(`gave up ${url} (${last})`);
       const pause = Math.min(120_000, 4000 * 2 ** (fails - 1));
       log("warn", `${res.status} ${url} - waiting ${Math.round(pause / 1000)}s`);
-      await wait(pause);
+      await nap(pause);
       continue;
     }
     if (res.status === 401 || res.status === 403) {
@@ -821,7 +841,12 @@ async function httpFile(url, dest, { referer } = {}) {
     } catch (err) {
       clearTimeout(quiet);
       const size = await stat(dest).then((st) => st.size).catch(() => 0);
+      if (stopped()) {
+        await rm(dest, { force: true });
+        throw new Cancelled("cancelled");
+      }
       const reason = describeError(err);
+      const silent = /^download stalled/.test(reason);
       // The site does not advertise Range, so try it after the first drop and learn from the answer.
       const canResume = rangeState !== "no";
       interruptions++;
@@ -834,9 +859,9 @@ async function httpFile(url, dest, { referer } = {}) {
       got = canResume ? size : 0;
       if (!got) await rm(dest, { force: true });
       status.downloadDone = got;
-      const pause = Math.min(60_000, 3000 * 2 ** Math.max(0, fails - 1));
-      log("warn", `download interrupted at ${MB(size)}${status.downloadTotal ? ` of ${MB(status.downloadTotal)}` : ""} (${reason}) - ${got ? "resuming" : "restarting"} in ${Math.round(pause / 1000)}s`);
-      await wait(pause);
+      const pause = silent ? quietPause() : Math.min(60_000, 3000 * 2 ** Math.max(0, fails - 1));
+      log("warn", `download interrupted at ${MB(size)}${status.downloadTotal ? ` of ${MB(status.downloadTotal)}` : ""} (${reason}) - ${got ? "resuming" : "restarting"} in ${fmtDuration(pause)}${silent ? " (the site throttles right after a failed attempt, so this waits longer)" : ""}`);
+      await nap(pause);
       continue;
     }
 
@@ -1255,8 +1280,10 @@ function startServer(port) {
           runNow = false;
           queueArmed = false;
           stopEpoch++;
+          stopCtl.abort();
+          stopCtl = new AbortController();
           status.sleepUntil = null;
-          log("info", "Stop requested (a download in progress will finish)");
+          log("info", "Stop requested");
           wake();
         } else if (action === "start" || action === "run") {
           if (!session.loggedIn && !cfg.dry) return json(res, 400, { error: "Log in first, then press Start." });
@@ -1311,6 +1338,8 @@ function startServer(port) {
       runNow = false;
       queueArmed = false;
       stopEpoch++;
+      stopCtl.abort();
+      stopCtl = new AbortController();
       status.sleepUntil = null;
       session.loggedIn = false;
       session.expired = false;
