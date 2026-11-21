@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.2.3";
+const VERSION = "1.2.4";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -707,6 +707,7 @@ async function httpFile(url, dest, { referer } = {}) {
   let validator = ""; // ETag / Last-Modified of the file being resumed
   let got = 0; // bytes already on disk
   let interruptions = 0;
+  let rangeState = "unknown"; // does the server honour Range? learned from its answer
   await rm(dest, { force: true });
   status.downloadDone = 0;
   status.downloadTotal = 0;
@@ -776,6 +777,7 @@ async function httpFile(url, dest, { referer } = {}) {
       const cr = /^bytes (\d+)-\d+\/(\d+|\*)$/i.exec(res.headers.get("content-range") || "");
       if (got > 0 && cr && Number(cr[1]) === got) {
         resuming = true;
+        rangeState = "yes";
         status.downloadTotal = cr[2] !== "*" ? Number(cr[2]) : 0;
       } else {
         await res.body?.cancel().catch(() => {});
@@ -787,13 +789,14 @@ async function httpFile(url, dest, { referer } = {}) {
       }
     } else {
       // A full response: anything saved before is replaced.
+      if (got > 0) rangeState = "no"; // we asked for a range and got the whole file
       got = 0;
       status.downloadTotal = Number(res.headers.get("content-length")) || 0;
     }
     validator = res.headers.get("etag") || res.headers.get("last-modified") || validator;
     if (!resuming) {
       status.downloadDone = 0;
-      log("info", `Downloading #${status.currentId ?? ""}: ${status.downloadTotal ? MB(status.downloadTotal) : "size unknown"}, resume ${res.headers.get("accept-ranges") === "bytes" ? "supported" : "not offered"}`);
+      log("info", `Downloading #${status.currentId ?? ""}: ${status.downloadTotal ? MB(status.downloadTotal) : "size unknown"}, resume ${rangeState === "yes" || res.headers.get("accept-ranges") === "bytes" ? "supported" : "will be tried if it drops"}`);
     } else {
       log("info", `Resuming at ${MB(got)} of ${status.downloadTotal ? MB(status.downloadTotal) : "?"}`);
     }
@@ -819,7 +822,8 @@ async function httpFile(url, dest, { referer } = {}) {
       clearTimeout(quiet);
       const size = await stat(dest).then((st) => st.size).catch(() => 0);
       const reason = describeError(err);
-      const canResume = res.headers.get("accept-ranges") === "bytes" || res.status === 206;
+      // The site does not advertise Range, so try it after the first drop and learn from the answer.
+      const canResume = rangeState !== "no";
       interruptions++;
       // Progress that can be resumed is not a failed attempt; restarting from zero is.
       if (received > 0 && canResume && interruptions < 40) fails = 0;
