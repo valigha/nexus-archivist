@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.2.0";
+const VERSION = "1.2.1";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -159,7 +159,7 @@ function describeError(err) {
 
 function isTransient(err) {
   const code = err?.cause?.code || "";
-  return err?.name === "TimeoutError" || ["ECONNRESET", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "EAI_AGAIN"].includes(code);
+  return err?.name === "TimeoutError" || ["ECONNRESET", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET", "EAI_AGAIN"].includes(code);
 }
 
 function sleep(ms) {
@@ -382,10 +382,21 @@ async function jarFetch(jar, url, { method = "GET", body, referer } = {}) {
     }
     await throttleHtml();
     let res;
-    try {
-      res = await fetch(cur, { method, headers, body, redirect: "manual", signal: AbortSignal.timeout(30_000) });
-    } catch (err) {
-      throw new Error(`${describeError(err)} (${cur})`);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        res = await fetch(cur, { method, headers, body, redirect: "manual", signal: AbortSignal.timeout(30_000) });
+        break;
+      } catch (err) {
+        // A reset before any response is safe to retry; the login form was not processed.
+        const safe = true;
+        if (attempt < 3 && safe && isTransient(err)) {
+          const pause = 2000 * 2 ** attempt;
+          log("warn", `${describeError(err)} (${cur}) - retrying in ${pause / 1000}s`);
+          await wait(pause);
+          continue;
+        }
+        throw new Error(`${describeError(err)} (${cur})`);
+      }
     }
     absorbInto(jar, res);
     const loc = res.headers.get("location");
