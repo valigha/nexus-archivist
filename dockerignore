@@ -1,0 +1,9 @@
+.git
+.github
+node_modules
+config
+library
+log
+*.md
+unraid.xml
+docker-compose.yml

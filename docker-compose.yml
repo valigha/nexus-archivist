@@ -1,0 +1,31 @@
+name: nexus-archivist
+
+services:
+  nexus:
+    build: .
+    image: nexus-archivist:local
+    container_name: nexus-archivist
+    restart: unless-stopped
+    mem_limit: 1g
+    ports:
+      - "8100:8100"
+    environment:
+      PUID: "99"
+      PGID: "100"
+      UMASK: "002"
+      TZ: "America/New_York"
+      HN_TAGS: ""
+      SLEEP_INTERVAL: "3600"
+      LIBRARY_PATH: /app/library/
+      LIBRARY_SPLIT: "10000"
+      DOWNLOAD_WORKERS: "2"
+      REQUEST_DELAY_MS: "1500"
+      CATCH_UP_STREAK: "40"
+      MAX_PER_CYCLE: "10"
+      STATUS_PORT: "8100"
+      DOWNLOADME_FILEPATH: /app/config/downloadme.txt
+      DONTDOWNLOADME_FILEPATH: /app/config/dontdownloadme.txt
+    volumes:
+      - ./config:/app/config
+      - ./library:/app/library
+      - ./log:/app/log

@@ -1,0 +1,56 @@
+
+  <header>
+    <div>
+      <h1>Nexus archivist</h1>
+      <div class="muted" id="sub">loading</div>
+    </div>
+    <div class="row">
+      <span class="pill" id="state">…</span>
+      <button id="pause">Pause</button>
+      <button class="primary" id="run">Run now</button>
+    </div>
+  </header>
+  <main>
+    <section class="card">
+      <div class="stats">
+        <div class="stat"><b id="library">0</b><span class="muted">in library</span></div>
+        <div class="stat"><b id="added">0</b><span class="muted">added this cycle</span></div>
+        <div class="stat"><b id="skipped">0</b><span class="muted">skipped</span></div>
+        <div class="stat"><b id="failed">0</b><span class="muted">failed</span></div>
+      </div>
+      <p id="message"></p>
+      <div class="bar" title="search"><span id="searchbar"></span></div>
+      <div class="bar" title="gallery"><span id="dlbar"></span></div>
+    </section>
+    <div class="grid">
+      <section class="card">
+        <h2>Search query</h2>
+        <textarea id="tags" rows="3" placeholder="artist:&quot;Aomushi&quot;"></textarea>
+        <p class="muted">Same syntax as the site. Exclusions for blocked tags are added automatically.</p>
+        <div class="row">
+          <button class="primary" id="save">Save query</button>
+          <span class="err" id="tagerr"></span>
+        </div>
+      </section>
+      <section class="card">
+        <h2>Add a book</h2>
+        <textarea id="want" rows="3" placeholder="https://hentainexus.com/view/22434"></textarea>
+        <p class="muted">Links or ids, one per line. Does not change the search query.</p>
+        <div class="row">
+          <button id="add">Queue</button>
+          <span class="err" id="wanterr"></span>
+        </div>
+        <p class="muted" id="queue"></p>
+      </section>
+    </div>
+    <section class="card">
+      <h2>Recent</h2>
+      <pre id="recent"></pre>
+    </section>
+    <section class="card">
+      <h2>Log</h2>
+      <pre id="log"></pre>
+    </section>
+  </main>
+  
+
