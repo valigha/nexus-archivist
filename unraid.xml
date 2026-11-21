@@ -27,6 +27,7 @@
   <Config Name="REQUEST_DELAY_MS" Target="REQUEST_DELAY_MS" Default="1500" Mode="" Description="Pause between HTML requests. Raise if you see 429." Type="Variable" Display="always" Required="false" Mask="false">1500</Config>
   <Config Name="MAX_SEARCH_PAGES" Target="MAX_SEARCH_PAGES" Default="0" Mode="" Description="Hard cap on search pages per cycle. 0 = unlimited." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
   <Config Name="COOKIE" Target="COOKIE" Default="" Mode="" Description="Optional browser Cookie header if Cloudflare returns 403." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+  <Config Name="USER_AGENT" Target="USER_AGENT" Default="" Mode="" Description="Optional. Set to the exact User-Agent of the browser you copied COOKIE from. Cloudflare ties cf_clearance to it." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
   <Config Name="LIBRARY_IMPORT_KEY" Target="LIBRARY_IMPORT_KEY" Default="" Mode="" Description="If set, POST /api/import requires header X-Api-Key." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
   <Config Name="STATUS_PORT" Target="STATUS_PORT" Default="8100" Mode="" Description="Port inside the container. Match the WebUI host port." Type="Variable" Display="advanced" Required="false" Mask="false">8100</Config>
   <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="Unraid nobody" Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
