@@ -21,7 +21,7 @@ const ORIGIN = "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.0.3";
+const VERSION = "1.0.4";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -705,6 +705,34 @@ function startServer(port) {
   }).listen(port, "0.0.0.0", () => log("info", `Dashboard on port ${port}`));
 }
 
+// Download queued one-off books without starting a full search cycle.
+async function drainOnly() {
+  const have = await indexLibrary(cfg.library);
+  const skip = new Set(await readIds(cfg.dont));
+  await drainWant(have, skip);
+  status.currentId = null;
+  status.currentTitle = "";
+  status.downloadDone = 0;
+  status.downloadTotal = 0;
+  status.libraryCount = have.size;
+  await saveLive();
+}
+
+// Sleep until the next cycle is due, but handle queued books as soon as they
+// arrive, and return straight away when "Run now" is pressed.
+async function sleepUntilDue() {
+  while (!shuttingDown && !runNow) {
+    const left = status.sleepUntil ? Date.parse(status.sleepUntil) - Date.now() : 0;
+    if (left <= 500) break;
+    status.state = "sleeping";
+    status.message = `Sleeping until ${status.sleepUntil}`;
+    await sleep(left);
+    if (wantQueue.length && !shuttingDown) {
+      try { await drainOnly(); } catch (err) { log("error", describeError(err)); }
+    }
+  }
+}
+
 async function main() {
   await mkdir(cfg.library, { recursive: true });
   await mkdir("/app/log", { recursive: true }).catch(() => {});
@@ -722,8 +750,7 @@ async function main() {
     }
     if (shuttingDown) break;
     if (!runNow && status.sleepUntil && Date.parse(status.sleepUntil) - Date.now() > 500) {
-      status.state = "sleeping";
-      await sleep(Date.parse(status.sleepUntil) - Date.now());
+      await sleepUntilDue();
       continue;
     }
     const forced = runNow;
@@ -738,7 +765,7 @@ async function main() {
     status.state = "sleeping";
     status.message = `Sleeping until ${until.toISOString()}`;
     log("info", status.message);
-    await sleep(cfg.sleep * 1000);
+    await sleepUntilDue();
   }
   status.state = "stopped";
 }
