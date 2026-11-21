@@ -16,7 +16,10 @@ if [ "$(id -u)" = "0" ]; then
   if ! getent passwd "$PUID" >/dev/null 2>&1; then
     adduser -D -H -u "$PUID" -G "$GROUP_NAME" nexus 2>/dev/null || true
   fi
-  chown -R "$PUID:$PGID" /app/config /app/library /app/log || true
+  # Config and log are small: fix ownership recursively.
+  chown -R "$PUID:$PGID" /app/config /app/log || true
+  # The library can hold thousands of files; only fix the top folder so startup stays fast.
+  chown "$PUID:$PGID" /app/library || true
   exec su-exec "$PUID:$PGID" node /app/worker.mjs
 fi
 

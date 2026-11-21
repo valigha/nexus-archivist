@@ -1,4 +1,119 @@
-
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nexus archivist</title>
+<style>
+  :root {
+    --bg: #14171c;
+    --card: #1c2027;
+    --line: #2b313b;
+    --text: #e6e9ee;
+    --muted: #8b94a3;
+    --accent: #5b8def;
+    --ok: #4cc38a;
+    --warn: #e5a93d;
+    --bad: #ef6a6a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--line);
+  }
+  h1 { margin: 0; font-size: 20px; }
+  h2 { margin: 0 0 10px; font-size: 15px; }
+  main { max-width: 1000px; margin: 0 auto; padding: 16px 20px 40px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid .card { margin-bottom: 0; }
+  .grid { margin-bottom: 16px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }
+  @media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+  .stat { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .stat b { display: block; font-size: 24px; }
+  button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 7px 14px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  textarea {
+    width: 100%;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    resize: vertical;
+  }
+  .pill {
+    display: inline-block;
+    padding: 3px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+  }
+  .pill.ok { color: var(--ok); border-color: var(--ok); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); }
+  .pill.bad { color: var(--bad); border-color: var(--bad); }
+  .bar { height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; margin-top: 8px; }
+  .bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  .err { color: var(--bad); font-size: 13px; }
+  #message { margin: 0; min-height: 1.3em; }
+  #banner {
+    display: none;
+    margin-bottom: 16px;
+    padding: 12px 14px;
+    border: 1px solid var(--bad);
+    border-radius: 10px;
+    background: rgba(239, 106, 106, .08);
+    color: var(--bad);
+  }
+  pre {
+    margin: 0;
+    max-height: 320px;
+    overflow: auto;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+</style>
+</head>
+<body>
   <header>
     <div>
       <h1>Nexus archivist</h1>
@@ -11,6 +126,7 @@
     </div>
   </header>
   <main>
+    <div id="banner"></div>
     <section class="card">
       <div class="stats">
         <div class="stat"><b id="library">0</b><span class="muted">in library</span></div>
@@ -26,7 +142,7 @@
       <section class="card">
         <h2>Search query</h2>
         <textarea id="tags" rows="3" placeholder="artist:&quot;Aomushi&quot;"></textarea>
-        <p class="muted">Same syntax as the site. Exclusions for blocked tags are added automatically.</p>
+        <p class="muted">Same syntax as the site. Exclusions for blocked tags are added automatically. After saving, press Run now to start.</p>
         <div class="row">
           <button class="primary" id="save">Save query</button>
           <span class="err" id="tagerr"></span>
@@ -45,12 +161,159 @@
     </div>
     <section class="card">
       <h2>Recent</h2>
-      <pre id="recent"></pre>
+      <pre id="recent">Nothing yet.</pre>
     </section>
     <section class="card">
       <h2>Log</h2>
       <pre id="log"></pre>
     </section>
   </main>
-  
 
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var editing = { tags: false };
+  var lastOk = 0;
+
+  function api(path, body) {
+    var opts = body === undefined
+      ? { cache: "no-store" }
+      : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
+    return fetch(path, opts).then(function (res) {
+      return res.json().then(function (data) {
+        if (!res.ok) throw new Error((data && data.error) || ("HTTP " + res.status));
+        return data;
+      });
+    });
+  }
+
+  function pct(done, total) {
+    return total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  }
+
+  function stateClass(s) {
+    if (s === "downloading" || s === "searching" || s === "dry-run") return "ok";
+    if (s === "paused" || s === "idle" || s === "sleeping" || s === "starting") return "warn";
+    if (s === "stopped") return "bad";
+    return "";
+  }
+
+  function fmtEvent(e) {
+    var t = (e.at || "").slice(11, 19);
+    var bits = [t, (e.type || "").toUpperCase()];
+    if (e.id) bits.push("#" + e.id);
+    if (e.title) bits.push(e.title);
+    if (e.pages) bits.push("(" + e.pages + " pages)");
+    return bits.join("  ");
+  }
+
+  function render(s) {
+    lastOk = Date.now();
+    $("banner").style.display = "none";
+
+    var sub = "v" + s.version + " · cycle " + s.cycle;
+    if (s.sleepUntil && s.state === "sleeping") {
+      sub += " · next run " + new Date(s.sleepUntil).toLocaleTimeString();
+    }
+    $("sub").textContent = sub;
+
+    var st = $("state");
+    st.textContent = s.state;
+    st.className = "pill " + stateClass(s.state);
+
+    $("library").textContent = s.libraryCount;
+    $("added").textContent = s.addedThisCycle;
+    $("skipped").textContent = s.skippedThisCycle;
+    $("failed").textContent = s.failedThisCycle;
+
+    var msg = s.message || "";
+    if (s.currentId) {
+      msg = "#" + s.currentId + (s.currentTitle ? " " + s.currentTitle : "");
+      if (s.downloadTotal) msg += " — " + s.downloadDone + " / " + s.downloadTotal + " images";
+    }
+    $("message").textContent = msg;
+    $("searchbar").style.width = pct(s.searchPage, s.searchPages) + "%";
+    $("dlbar").style.width = pct(s.downloadDone, s.downloadTotal) + "%";
+
+    $("pause").textContent = s.paused ? "Paused" : "Pause";
+    $("pause").disabled = !!s.paused;
+    $("run").textContent = s.paused ? "Resume / Run now" : "Run now";
+
+    if (!editing.tags && document.activeElement !== $("tags")) {
+      $("tags").value = s.tagsInput || "";
+    }
+
+    $("queue").textContent = s.wantQueue && s.wantQueue.length
+      ? "Queued: " + s.wantQueue.join(", ")
+      : "";
+
+    $("recent").textContent = s.recent && s.recent.length
+      ? s.recent.map(fmtEvent).join("\n")
+      : "Nothing yet.";
+
+    var logEl = $("log");
+    var atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 20;
+    logEl.textContent = (s.log || []).join("\n");
+    if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+
+    // Surface the two failures people hit most, right at the top of the page.
+    var hit = (s.log || []).slice().reverse().find(function (l) {
+      return /ERROR/.test(l) && /(403|Cloudflare)/i.test(l);
+    });
+    if (hit && s.failedThisCycle > 0) {
+      $("banner").textContent =
+        "The site is blocking requests (403 / Cloudflare). Set the COOKIE variable in the Unraid template " +
+        "with a Cookie header copied from a browser on the same network, then restart the container.";
+      $("banner").style.display = "block";
+    }
+  }
+
+  function poll() {
+    api("/api/status").then(render).catch(function (err) {
+      var stale = Date.now() - lastOk > 8000;
+      if (stale) {
+        $("state").textContent = "offline";
+        $("state").className = "pill bad";
+        $("banner").textContent = "Cannot reach the archivist API: " + err.message;
+        $("banner").style.display = "block";
+      }
+    });
+  }
+
+  function control(action) {
+    api("/api/control", { action: action }).then(render).catch(function (err) {
+      $("banner").textContent = err.message;
+      $("banner").style.display = "block";
+    });
+  }
+
+  $("pause").addEventListener("click", function () { control("pause"); });
+  $("run").addEventListener("click", function () { control("run"); });
+
+  $("tags").addEventListener("input", function () { editing.tags = true; });
+
+  $("save").addEventListener("click", function () {
+    $("tagerr").textContent = "";
+    api("/api/config", { tags: $("tags").value }).then(function (s) {
+      editing.tags = false;
+      render(s);
+      $("tagerr").textContent = "";
+      $("message").textContent = "Query saved. Press Run now to start.";
+    }).catch(function (err) { $("tagerr").textContent = err.message; });
+  });
+
+  $("add").addEventListener("click", function () {
+    $("wanterr").textContent = "";
+    api("/api/want", { text: $("want").value }).then(function (s) {
+      $("want").value = "";
+      render(s);
+    }).catch(function (err) { $("wanterr").textContent = err.message; });
+  });
+
+  poll();
+  setInterval(poll, 2000);
+})();
+</script>
+</body>
+</html>
