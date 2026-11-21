@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import JSZip from "jszip";
 
 const ORIGIN = "https://hentainexus.com";
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
