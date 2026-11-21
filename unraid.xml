@@ -8,12 +8,12 @@
   <Privileged>false</Privileged>
   <Support/>
   <Project>https://hentainexus.com/page/search</Project>
-  <Overview>Scheduled HentaiNexus CBZ archivist. Set a search query in the web UI or HN_TAGS, map a library folder, and it writes missing galleries as CBZ with ComicInfo.xml. Uses public gallery and read pages. Does not call the login zip endpoint. Blocked tags are always skipped.</Overview>
+  <Overview>Scheduled HentaiNexus CBZ archivist. Set a search query in the web UI or HN_TAGS, map a library folder, and it writes missing galleries as CBZ with ComicInfo.xml. Downloads use the site's own zip download, so the COOKIE variable (your logged-in session) is required. Blocked tags are always skipped.</Overview>
   <Category>MediaApp:Books Downloaders:</Category>
   <WebUI>http://[IP]:[PORT:8100]/</WebUI>
   <ExtraParams/>
   <PostArgs/>
-  <Requires>Replace YOUR_USER in Repository. After the first Actions build, make the GHCR package public so Unraid can pull it.</Requires>
+  <Requires>Set COOKIE to the Cookie header of a browser logged in to hentainexus.com (see README). After the first Actions build, make the GHCR package public so Unraid can pull it.</Requires>
   <Config Name="WebUI" Target="8100" Default="8100" Mode="tcp" Description="Status dashboard" Type="Port" Display="always" Required="true" Mask="false">8100</Config>
   <Config Name="Library" Target="/app/library" Default="/mnt/user/media/hentainexus" Mode="rw" Description="Where CBZ files are written. Do not point this at the nhentai library." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/media/hentainexus</Config>
   <Config Name="Config" Target="/app/config" Default="/mnt/user/appdata/nexus-archivist/config" Mode="rw" Description="Query save, download lists, optional .env" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/nexus-archivist/config</Config>
@@ -21,12 +21,13 @@
   <Config Name="HN_TAGS" Target="HN_TAGS" Default="" Mode="" Description="Search query, same syntax as the site. Example: artist:&quot;Aomushi&quot; or tag:uncensored. Empty waits for the web UI." Type="Variable" Display="always" Required="false" Mask="false"></Config>
   <Config Name="SLEEP_INTERVAL" Target="SLEEP_INTERVAL" Default="3600" Mode="" Description="Seconds to wait after a cycle" Type="Variable" Display="always" Required="true" Mask="false">3600</Config>
   <Config Name="LIBRARY_SPLIT" Target="LIBRARY_SPLIT" Default="10000" Mode="" Description="Split into folders of this many ids. 0 = flat." Type="Variable" Display="always" Required="false" Mask="false">10000</Config>
-  <Config Name="DOWNLOAD_WORKERS" Target="DOWNLOAD_WORKERS" Default="2" Mode="" Description="Parallel image downloads per gallery" Type="Variable" Display="advanced" Required="false" Mask="false">2</Config>
   <Config Name="CATCH_UP_STREAK" Target="CATCH_UP_STREAK" Default="40" Mode="" Description="Stop a cycle after this many already-have galleries in a row. 0 = walk every search page." Type="Variable" Display="always" Required="false" Mask="false">40</Config>
   <Config Name="MAX_PER_CYCLE" Target="MAX_PER_CYCLE" Default="10" Mode="" Description="Cap new CBZs per cycle. 0 = unlimited." Type="Variable" Display="always" Required="false" Mask="false">10</Config>
   <Config Name="REQUEST_DELAY_MS" Target="REQUEST_DELAY_MS" Default="1500" Mode="" Description="Pause between HTML requests. Raise if you see 429." Type="Variable" Display="always" Required="false" Mask="false">1500</Config>
   <Config Name="MAX_SEARCH_PAGES" Target="MAX_SEARCH_PAGES" Default="0" Mode="" Description="Hard cap on search pages per cycle. 0 = unlimited." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
-  <Config Name="COOKIE" Target="COOKIE" Default="" Mode="" Description="Optional browser Cookie header if Cloudflare returns 403." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+  <Config Name="COOKIE" Target="COOKIE" Default="" Mode="" Description="Required. The Cookie header from a browser logged in to hentainexus.com. Paste only the value. Expires: replace it when the dashboard says LOGIN REQUIRED." Type="Variable" Display="always" Required="true" Mask="true"></Config>
+  <Config Name="ZIP_DELAY_MS" Target="ZIP_DELAY_MS" Default="5000" Mode="" Description="Pause after each zip download, in milliseconds." Type="Variable" Display="advanced" Required="false" Mask="false">5000</Config>
+  <Config Name="ZIP_TIMEOUT_SEC" Target="ZIP_TIMEOUT_SEC" Default="900" Mode="" Description="Longest a single zip download may take, in seconds." Type="Variable" Display="advanced" Required="false" Mask="false">900</Config>
   <Config Name="USER_AGENT" Target="USER_AGENT" Default="" Mode="" Description="Optional. Set to the exact User-Agent of the browser you copied COOKIE from. Cloudflare ties cf_clearance to it." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
   <Config Name="LIBRARY_IMPORT_KEY" Target="LIBRARY_IMPORT_KEY" Default="" Mode="" Description="If set, POST /api/import requires header X-Api-Key." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
   <Config Name="STATUS_PORT" Target="STATUS_PORT" Default="8100" Mode="" Description="Port inside the container. Match the WebUI host port." Type="Variable" Display="advanced" Required="false" Mask="false">8100</Config>

@@ -188,6 +188,8 @@
     });
   }
 
+  function mb(n) { return (n / 1048576).toFixed(1) + " MB"; }
+
   function pct(done, total) {
     return total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
   }
@@ -230,7 +232,9 @@
     var msg = s.message || "";
     if (s.currentId) {
       msg = "#" + s.currentId + (s.currentTitle ? " " + s.currentTitle : "");
-      if (s.downloadTotal) msg += " — " + s.downloadDone + " / " + s.downloadTotal + " images";
+      if (s.downloadDone) {
+        msg += " — " + mb(s.downloadDone) + (s.downloadTotal ? " / " + mb(s.downloadTotal) : "");
+      }
     }
     $("message").textContent = msg;
     $("searchbar").style.width = pct(s.searchPage, s.searchPages) + "%";
@@ -257,14 +261,20 @@
     logEl.textContent = (s.log || []).join("\n");
     if (atBottom) logEl.scrollTop = logEl.scrollHeight;
 
-    // Surface the two failures people hit most, right at the top of the page.
-    var hit = (s.log || []).slice().reverse().find(function (l) {
-      return /ERROR/.test(l) && /(403|Cloudflare)/i.test(l);
-    });
-    if (hit && s.failedThisCycle > 0) {
-      $("banner").textContent =
-        "The site is blocking requests (403 / Cloudflare). Set the COOKIE variable in the Unraid template " +
-        "with a Cookie header copied from a browser on the same network, then restart the container.";
+    // Surface the failures people hit most, right at the top of the page.
+    var recent = (s.log || []).slice(-40).reverse();
+    var login = recent.find(function (l) { return /ERROR/.test(l) && /LOGIN REQUIRED/.test(l); });
+    var blocked = recent.find(function (l) { return /ERROR/.test(l) && /(403|Cloudflare)/i.test(l); });
+    var msgText = "";
+    if (s.cookieSet === false) {
+      msgText = "COOKIE is not set. Downloads need your logged-in session: set the COOKIE variable in the Unraid template (see README), then restart the container.";
+    } else if (login && s.failedThisCycle > 0) {
+      msgText = "Login required: the COOKIE is missing or has expired. Log in to hentainexus.com in a browser, copy the Cookie header, update the COOKIE variable and restart the container.";
+    } else if (blocked && s.failedThisCycle > 0) {
+      msgText = "The site is blocking requests (403 / Cloudflare). Use a Cookie and User-Agent from a browser on the same network as the server.";
+    }
+    if (msgText) {
+      $("banner").textContent = msgText;
       $("banner").style.display = "block";
     }
   }
