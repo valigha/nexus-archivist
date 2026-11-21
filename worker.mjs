@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import JSZip from "jszip";
 
 const ORIGIN = "https://hentainexus.com";
-const VERSION = "1.0.1";
+const VERSION = "1.0.2";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -109,6 +109,36 @@ function xml(s) {
 }
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const NET_HINTS = {
+  ENOTFOUND: "DNS could not resolve the host. Check Pi-hole/AdGuard/router blocking, or give the container a DNS server (Extra Parameters: --dns 1.1.1.1).",
+  EAI_AGAIN: "DNS lookup timed out. Check the container DNS (Extra Parameters: --dns 1.1.1.1).",
+  ENETUNREACH: "Network unreachable, often broken IPv6. Try variable NODE_OPTIONS=--dns-result-order=ipv4first.",
+  EHOSTUNREACH: "Host unreachable. Check routing, VPN and firewall.",
+  ECONNREFUSED: "Connection refused. Something is blocking the connection (firewall, VPN, ISP).",
+  ECONNRESET: "Connection was reset. The site or a firewall closed it; this can be bot protection.",
+  ETIMEDOUT: "Connection timed out. Check firewall, VPN and IPv6 routing.",
+  UND_ERR_CONNECT_TIMEOUT: "Connection timed out. Check firewall, VPN and IPv6 routing.",
+  CERT_HAS_EXPIRED: "TLS certificate problem. Check the Unraid clock and any HTTPS-intercepting proxy.",
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE: "TLS certificate problem. Check for an HTTPS-intercepting proxy or filter.",
+};
+
+/** Turn Node's opaque "fetch failed" into the real reason plus a hint. */
+function describeError(err) {
+  if (!(err instanceof Error)) return String(err);
+  const cause = err.cause;
+  if (!cause) return err.name === "TimeoutError" ? "request timed out" : err.message;
+  const first = Array.isArray(cause.errors) ? cause.errors[0] : null;
+  const code = cause.code || first?.code || "";
+  const detail = cause.message || first?.message || "";
+  const hint = NET_HINTS[code];
+  return `${err.message}: ${[code, detail].filter(Boolean).join(" ")}${hint ? ` - ${hint}` : ""}`;
+}
+
+function isTransient(err) {
+  const code = err?.cause?.code || "";
+  return err?.name === "TimeoutError" || ["ECONNRESET", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "EAI_AGAIN"].includes(code);
+}
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -210,7 +240,19 @@ async function http(url, { image = false, referer } = {}) {
   let last = "no response";
   for (let i = 0; i < 5; i++) {
     if (!image) await throttleHtml();
-    const res = await fetch(url, { headers, redirect: "follow" });
+    let res;
+    try {
+      res = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(image ? 120_000 : 60_000) });
+    } catch (err) {
+      last = describeError(err);
+      if (isTransient(err) && i < 4) {
+        const pause = Math.min(60_000, 3000 * 2 ** i);
+        log("warn", `${last} (${url}) - retrying in ${Math.round(pause / 1000)}s`);
+        await wait(pause);
+        continue;
+      }
+      throw new Error(`${last} (${url})`);
+    }
     if (res.status === 429 || res.status === 503 || res.status === 502) {
       const pause = Math.min(120_000, 4000 * 2 ** i);
       log("warn", `${res.status} ${url} — waiting ${Math.round(pause / 1000)}s`);
@@ -218,7 +260,7 @@ async function http(url, { image = false, referer } = {}) {
       last = String(res.status);
       continue;
     }
-    if (res.status === 403) throw new Error("403. If this is Cloudflare, set COOKIE from a browser that can open the site.");
+    if (res.status === 403) throw new Error(`403 from ${url}. If this is Cloudflare, set COOKIE from a browser that can open the site, and set USER_AGENT to the same browser User-Agent.`);
     if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
     if (image) {
       const buf = Buffer.from(await res.arrayBuffer());
@@ -440,7 +482,7 @@ async function takeOne(id, have, skip) {
     return await downloadGallery(id, have);
   } catch (err) {
     status.failedThisCycle += 1;
-    const title = err instanceof Error ? err.message : String(err);
+    const title = describeError(err);
     log("error", `#${id} ${title}`);
     pushEvent("error", { id, title });
     return "failed";
@@ -661,6 +703,7 @@ async function main() {
   loadLive();
   if (cfg.port) startServer(cfg.port);
   log("info", `Nexus archivist ${VERSION}. library=${cfg.library} delay=${cfg.delay}ms query=${status.tags || "(none)"}`);
+  log("info", `cookie=${cfg.cookie ? "set" : "not set"} user-agent=${process.env.USER_AGENT ? "custom" : "default"}`);
   for (;;) {
     if (shuttingDown) break;
     while (paused && !runNow && !wantQueue.length && !shuttingDown) {
@@ -676,7 +719,7 @@ async function main() {
     }
     const forced = runNow;
     runNow = false;
-    try { await runCycle(); } catch (err) { log("error", err instanceof Error ? err.message : String(err)); }
+    try { await runCycle(); } catch (err) { log("error", describeError(err)); }
     if (cfg.once || shuttingDown) break;
     if (paused && !forced) continue;
     if (runNow) continue;

@@ -20,3 +20,12 @@ Edit `unraid.xml` and replace `YOUR_USER`. Docker → Add Container → import t
 
 ```bash
 docker compose up --build
+
+## Troubleshooting
+
+The dashboard Log box shows the real reason a request failed.
+
+- `ENOTFOUND` / `EAI_AGAIN`: the container cannot resolve the site. Check Pi-hole, AdGuard or router blocking, or add `--dns 1.1.1.1` to Extra Parameters.
+- `ENETUNREACH`: often broken IPv6. Add variable `NODE_OPTIONS` = `--dns-result-order=ipv4first`.
+- `ECONNRESET` / `ETIMEDOUT` / `ECONNREFUSED`: a firewall, VPN or the site is dropping the connection.
+- `403` or `Cloudflare challenge`: set `COOKIE` to the Cookie header from a browser that can open the site, and set `USER_AGENT` to that same browser User-Agent. Use a browser on the same network as the server. The cookie expires, so refresh it when the 403 comes back.
