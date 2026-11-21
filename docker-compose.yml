@@ -15,10 +15,10 @@ services:
       UMASK: "002"
       TZ: "America/New_York"
       HN_TAGS: ""
+      COOKIE: "${COOKIE:-}"
       SLEEP_INTERVAL: "3600"
       LIBRARY_PATH: /app/library/
       LIBRARY_SPLIT: "10000"
-      DOWNLOAD_WORKERS: "2"
       REQUEST_DELAY_MS: "1500"
       CATCH_UP_STREAK: "40"
       MAX_PER_CYCLE: "10"

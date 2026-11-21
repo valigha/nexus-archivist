@@ -1,27 +1,31 @@
 #!/usr/bin/env node
 /**
  * HentaiNexus CBZ archivist.
- * Public HTML only: search, /view/{id}, /read/{id}/{page}.
- * Does not call /zip/ and does not decrypt the reader payload.
+ * Search and /view/{id} pages give the metadata. The images come from the
+ * site's own /zip/{id} download, using the logged-in session in COOKIE.
+ * The zip is turned into a CBZ by adding ComicInfo.xml. Nothing from the
+ * reader pages is decoded.
  */
 import { createServer } from "node:http";
 import net from "node:net";
 import dns from "node:dns";
 import { timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile, appendFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile, appendFile } from "node:fs/promises";
+import { readFileSync, createWriteStream } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import zlib from "node:zlib";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import JSZip from "jszip";
 
-const ORIGIN = "https://hentainexus.com";
+const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 
 // Node gives each address only 250 ms to connect before trying the next one,
 // and fails with ETIMEDOUT when all of them are slow once. Allow longer, and
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.0.4";
+const VERSION = "1.1.0";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -34,11 +38,12 @@ const cfg = {
   dont: process.env.DONTDOWNLOADME_FILEPATH || "/app/config/dontdownloadme.txt",
   sleep: Math.max(0, Number(process.env.SLEEP_INTERVAL) || 3600),
   delay: Math.max(200, Number(process.env.REQUEST_DELAY_MS) || 1500),
-  workers: Math.max(1, Number(process.env.DOWNLOAD_WORKERS) || 2),
   streakCap: Math.max(0, Number(process.env.CATCH_UP_STREAK) || 40),
   maxPerCycle: Math.max(0, Number(process.env.MAX_PER_CYCLE) || 10),
   maxPages: Math.max(0, Number(process.env.MAX_SEARCH_PAGES) || 0),
-  cookie: process.env.COOKIE || "",
+  cookie: (process.env.COOKIE || "").replace(/^\s*cookie:\s*/i, "").trim(),
+  zipTimeout: Math.max(60, Number(process.env.ZIP_TIMEOUT_SEC) || 900),
+  zipDelay: (process.env.ZIP_DELAY_MS ?? "") === "" ? 5000 : Math.max(0, Number(process.env.ZIP_DELAY_MS) || 0),
   importKey: process.env.LIBRARY_IMPORT_KEY || "",
   ua: process.env.USER_AGENT
     || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -66,6 +71,7 @@ const status = {
   currentId: null,
   currentTitle: "",
   message: "",
+  cookieSet: false,
   tagsInput: "",
   tags: "",
   sleepUntil: null,
@@ -80,10 +86,12 @@ let runNow = false;
 let shuttingDown = false;
 let wantQueue = [];
 let wantBusy = false;
+let authFailed = false;
 let sleepTimer = null;
 let sleepResolve = null;
 let lastHtmlAt = 0;
 
+status.cookieSet = !!cfg.cookie;
 const livePath = join(dirname(cfg.downloadme), "nexus.json");
 
 function flag(v) {
@@ -238,19 +246,19 @@ async function throttleHtml() {
   lastHtmlAt = Date.now();
 }
 
-async function http(url, { image = false, referer } = {}) {
+async function http(url, { referer } = {}) {
   const headers = {
     "User-Agent": cfg.ua,
-    Accept: image ? "image/avif,image/webp,image/*,*/*;q=0.8" : "text/html",
+    Accept: "text/html",
     Referer: referer || `${ORIGIN}/`,
   };
   if (cfg.cookie) headers.Cookie = cfg.cookie;
   let last = "no response";
   for (let i = 0; i < 5; i++) {
-    if (!image) await throttleHtml();
+    await throttleHtml();
     let res;
     try {
-      res = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(image ? 120_000 : 60_000) });
+      res = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(60_000) });
     } catch (err) {
       last = describeError(err);
       if (isTransient(err) && i < 4) {
@@ -270,11 +278,6 @@ async function http(url, { image = false, referer } = {}) {
     }
     if (res.status === 403) throw new Error(`403 from ${url}. If this is Cloudflare, set COOKIE from a browser that can open the site, and set USER_AGENT to the same browser User-Agent.`);
     if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
-    if (image) {
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (!buf.length) throw new Error(`empty image ${url}`);
-      return buf;
-    }
     const text = await res.text();
     if (/Just a moment|cf-browser-verification|challenge-platform/i.test(text)) {
       throw new Error("Cloudflare challenge. Set COOKIE from a browser that can open the site.");
@@ -334,12 +337,6 @@ function parseGallery(html, id) {
     pages: pageNums.length || pages,
     unsafe: UNSAFE.test(blob),
   };
-}
-
-function imageUrl(html) {
-  const urls = [...html.matchAll(/(?:https?:)?\/\/images\.hentainexus\.com\/[^"'\s<>]+/g)]
-    .map((m) => (m[0].startsWith("//") ? `https:${m[0]}` : m[0]));
-  return urls.find((u) => !u.includes(".thumb.")) || null;
 }
 
 function comicInfo(g) {
@@ -403,12 +400,194 @@ async function exists(path) {
   try { await stat(path); return true; } catch { return false; }
 }
 
-async function mapPool(items, limit, fn) {
-  let next = 0;
-  const n = Math.max(1, Math.min(limit, items.length || 1));
-  await Promise.all(Array.from({ length: n }, async () => {
-    while (next < items.length) await fn(items[next++]);
-  }));
+const LOGIN_HELP = `Log in at ${ORIGIN} in your browser, copy the Cookie header of a request to the site, and put it in the COOKIE variable of the Unraid template.`;
+
+async function httpFile(url, dest, { referer } = {}) {
+  const headers = {
+    "User-Agent": cfg.ua,
+    Accept: "application/zip,application/octet-stream,*/*;q=0.8",
+    Referer: referer || `${ORIGIN}/`,
+  };
+  if (cfg.cookie) headers.Cookie = cfg.cookie;
+  let last = "no response";
+  for (let i = 0; i < 4; i++) {
+    await throttleHtml();
+    status.downloadDone = 0;
+    status.downloadTotal = 0;
+    let res;
+    try {
+      res = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(cfg.zipTimeout * 1000) });
+    } catch (err) {
+      last = describeError(err);
+      if (isTransient(err) && i < 3) {
+        const pause = Math.min(60_000, 3000 * 2 ** i);
+        log("warn", `${last} (${url}) - retrying in ${Math.round(pause / 1000)}s`);
+        await wait(pause);
+        continue;
+      }
+      throw new Error(`${last} (${url})`);
+    }
+    if (res.status === 429 || res.status === 503 || res.status === 502) {
+      const pause = Math.min(120_000, 4000 * 2 ** i);
+      log("warn", `${res.status} ${url} - waiting ${Math.round(pause / 1000)}s`);
+      await wait(pause);
+      last = String(res.status);
+      continue;
+    }
+    if (res.status === 401 || res.status === 403) {
+      await res.body?.cancel().catch(() => {});
+      throw new Error(`LOGIN REQUIRED: ${res.status} from ${url}. Your session may have expired, or Cloudflare is blocking the request (then also set USER_AGENT to the same browser). ${LOGIN_HELP}`);
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
+    const type = (res.headers.get("content-type") || "").toLowerCase();
+    if (type.includes("text/html") || type.includes("json")) {
+      const body = (await res.text()).slice(0, 4000);
+      if (/Just a moment|cf-browser-verification|challenge-platform/i.test(body)) {
+        throw new Error("Cloudflare challenge on the zip download. Set COOKIE (and USER_AGENT) from a browser that can open the site.");
+      }
+      throw new Error(`LOGIN REQUIRED: the site returned a web page instead of a zip, so the COOKIE is missing or expired. ${LOGIN_HELP}`);
+    }
+    status.downloadTotal = Number(res.headers.get("content-length")) || 0;
+    try {
+      const body = Readable.fromWeb(res.body);
+      body.on("data", (chunk) => { status.downloadDone += chunk.length; });
+      await pipeline(body, createWriteStream(dest));
+    } catch (err) {
+      await rm(dest, { force: true });
+      last = describeError(err);
+      if (i < 3 && !shuttingDown) {
+        log("warn", `download interrupted (${last}) - retrying`);
+        await wait(3000 * 2 ** i);
+        continue;
+      }
+      throw new Error(`${last} (${url})`);
+    }
+    const fh = await open(dest, "r");
+    try {
+      const head = Buffer.alloc(4);
+      await fh.read(head, 0, 4, 0);
+      if (head.readUInt16LE(0) !== 0x4b50) throw new Error(`the download from ${url} is not a zip file`);
+    } finally {
+      await fh.close();
+    }
+    return;
+  }
+  throw new Error(`gave up ${url} (${last})`);
+}
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  if (typeof zlib.crc32 === "function") return zlib.crc32(buf);
+  let c = 0xffffffff;
+  for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+const IMAGE_NAME = /\.(jpe?g|png|webp|avif|gif|bmp)$/i;
+
+/**
+ * Add ComicInfo.xml to an existing zip in place, without unpacking it.
+ * The new entry is written over the old central directory, which is then
+ * rewritten after it. makeXml(imageCount) returns the XML text.
+ * Returns the number of images in the zip.
+ */
+async function addComicInfo(path, makeXml) {
+  const fh = await open(path, "r+");
+  try {
+    const { size } = await fh.stat();
+    const tailLen = Math.min(size, 65557);
+    const tail = Buffer.alloc(tailLen);
+    await fh.read(tail, 0, tailLen, size - tailLen);
+    let e = -1;
+    for (let i = tailLen - 22; i >= 0; i--) {
+      if (tail.readUInt32LE(i) === 0x06054b50) { e = i; break; }
+    }
+    if (e < 0) throw new Error("the downloaded file is not a valid zip (no end record)");
+    const entries = tail.readUInt16LE(e + 10);
+    const cdSize = tail.readUInt32LE(e + 12);
+    const cdOffset = tail.readUInt32LE(e + 16);
+    if (entries === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) throw new Error("zip64 archives are not supported");
+    if (entries >= 0xfffe) throw new Error("too many files in the zip");
+    if (cdOffset + cdSize > size) throw new Error("the zip directory is corrupt");
+    const cd = Buffer.alloc(cdSize);
+    await fh.read(cd, 0, cdSize, cdOffset);
+
+    let images = 0;
+    let hasInfo = false;
+    let p = 0;
+    for (let n = 0; n < entries; n++) {
+      if (p + 46 > cd.length || cd.readUInt32LE(p) !== 0x02014b50) throw new Error("the zip directory is corrupt");
+      const nameLen = cd.readUInt16LE(p + 28);
+      const extraLen = cd.readUInt16LE(p + 30);
+      const commentLen = cd.readUInt16LE(p + 32);
+      const name = cd.toString("utf8", p + 46, p + 46 + nameLen);
+      if (IMAGE_NAME.test(name)) images += 1;
+      if (name.toLowerCase() === "comicinfo.xml") hasInfo = true;
+      p += 46 + nameLen + extraLen + commentLen;
+    }
+    if (!images) throw new Error("the zip contains no images");
+    if (hasInfo) return images;
+
+    const xml = Buffer.from(makeXml(images), "utf8");
+    const name = Buffer.from("ComicInfo.xml");
+    const crc = crc32(xml);
+    const d = new Date();
+    const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+    const dosDate = (Math.max(0, d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+
+    const local = Buffer.alloc(30 + name.length);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt16LE(dosTime, 10);
+    local.writeUInt16LE(dosDate, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(xml.length, 18);
+    local.writeUInt32LE(xml.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(0, 28);
+    name.copy(local, 30);
+
+    const central = Buffer.alloc(46 + name.length);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(dosTime, 12);
+    central.writeUInt16LE(dosDate, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(xml.length, 20);
+    central.writeUInt32LE(xml.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt32LE(cdOffset, 42);
+    name.copy(central, 46);
+
+    const newCdOffset = cdOffset + local.length + xml.length;
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(entries + 1, 8);
+    eocd.writeUInt16LE(entries + 1, 10);
+    eocd.writeUInt32LE(cdSize + central.length, 12);
+    eocd.writeUInt32LE(newCdOffset, 16);
+
+    const out = Buffer.concat([local, xml, cd, central, eocd]);
+    await fh.write(out, 0, out.length, cdOffset);
+    await fh.truncate(cdOffset + out.length);
+    return images;
+  } finally {
+    await fh.close();
+  }
 }
 
 async function downloadGallery(id, have) {
@@ -418,6 +597,9 @@ async function downloadGallery(id, have) {
   status.downloadDone = 0;
   status.downloadTotal = 0;
   status.message = `Gallery ${id}`;
+  if (!cfg.dry && !cfg.cookie) {
+    throw new Error(`LOGIN REQUIRED: COOKIE is not set. ${LOGIN_HELP}`);
+  }
   const view = await http(`${ORIGIN}/view/${id}`);
   const g = parseGallery(view, id);
   status.currentTitle = g.title;
@@ -438,9 +620,8 @@ async function downloadGallery(id, have) {
     status.skippedThisCycle += 1;
     return "have";
   }
-  if (!g.pageNums.length) throw new Error("no pages listed");
   if (cfg.dry) {
-    log("info", `DRY_RUN ${dest} (${g.pageNums.length} pages)`);
+    log("info", `DRY_RUN ${dest} (${g.pages} pages)`);
     status.addedThisCycle += 1;
     pushEvent("dry", { id, title: filename });
     return "wrote";
@@ -450,34 +631,17 @@ async function downloadGallery(id, have) {
   await rm(tmp, { recursive: true, force: true });
   await mkdir(tmp, { recursive: true });
   try {
-    const pages = [];
-    for (const n of g.pageNums) {
-      if (shuttingDown) throw new Error("shutdown");
-      const pageUrl = `${ORIGIN}/read/${id}/${String(n).padStart(3, "0")}`;
-      const html = await http(pageUrl, { referer: `${ORIGIN}/view/${id}` });
-      const url = imageUrl(html);
-      if (!url) throw new Error(`no image on page ${n}`);
-      const ext = (url.split("?")[0].split(".").pop() || "avif").toLowerCase().replace(/[^a-z0-9]/g, "") || "avif";
-      pages.push({ url, pageUrl, name: `${id}-${String(n).padStart(5, "0")}.${ext}` });
-    }
-    status.downloadTotal = pages.length;
-    await mapPool(pages, cfg.workers, async (page) => {
-      const bytes = await http(page.url, { image: true, referer: page.pageUrl });
-      await writeFile(join(tmp, page.name), bytes);
-      status.downloadDone += 1;
-    });
-    const zip = new JSZip();
-    zip.file("ComicInfo.xml", comicInfo(g));
-    for (const page of pages) zip.file(page.name, await readFile(join(tmp, page.name)));
-    const buf = await zip.generateAsync({ type: "nodebuffer", compression: "STORE" });
-    const partial = join(tmp, `${id}.partial`);
-    await writeFile(partial, buf);
-    await rename(partial, dest);
+    const zipPath = join(tmp, `${id}.zip`);
+    status.message = `Downloading zip for #${id}`;
+    await httpFile(`${ORIGIN}/zip/${id}`, zipPath, { referer: `${ORIGIN}/view/${id}` });
+    const pages = await addComicInfo(zipPath, (count) => comicInfo({ ...g, pages: count }));
+    await rename(zipPath, dest);
     have.add(id);
     status.libraryCount = have.size;
     status.addedThisCycle += 1;
-    log("info", `Wrote ${dest} (${pages.length} pages)`);
-    pushEvent("wrote", { id, title: filename, pages: pages.length });
+    log("info", `Wrote ${dest} (${pages} pages)`);
+    pushEvent("wrote", { id, title: filename, pages });
+    if (cfg.zipDelay) await wait(cfg.zipDelay);
     return "wrote";
   } finally {
     if (cfg.cleanup) await rm(tmp, { recursive: true, force: true });
@@ -492,6 +656,7 @@ async function takeOne(id, have, skip) {
   } catch (err) {
     status.failedThisCycle += 1;
     const title = describeError(err);
+    if (/^LOGIN REQUIRED/.test(title)) authFailed = true;
     log("error", `#${id} ${title}`);
     pushEvent("error", { id, title });
     return "failed";
@@ -507,6 +672,10 @@ async function drainWant(have, skip) {
       log("info", `One-off #${id}`);
       await takeOne(id, have, skip);
       wantQueue.shift();
+      if (authFailed && wantQueue.length) {
+        log("warn", `Login required: dropped ${wantQueue.length} more queued book(s). Fix COOKIE and queue them again.`);
+        wantQueue.length = 0;
+      }
       status.wantQueue = [...wantQueue];
       await saveLive();
     }
@@ -556,6 +725,7 @@ async function searchCycle(have, skip) {
         return;
       }
       const result = await takeOne(id, have, skip);
+      if (authFailed) { log("warn", "Stopping this cycle: login required."); return; }
       if (result === "wrote") added += 1;
       if (paused && !runNow) return;
     }
@@ -564,6 +734,7 @@ async function searchCycle(have, skip) {
 }
 
 async function runCycle() {
+  authFailed = false;
   status.cycle += 1;
   status.addedThisCycle = 0;
   status.skippedThisCycle = 0;
@@ -580,7 +751,7 @@ async function runCycle() {
   if (listed.length) {
     log("info", `${listed.length} ids in downloadme.txt`);
     for (const id of listed) {
-      if (shuttingDown || (paused && !runNow)) break;
+      if (shuttingDown || authFailed || (paused && !runNow)) break;
       if (cfg.maxPerCycle && status.addedThisCycle >= cfg.maxPerCycle) break;
       await takeOne(id, have, skip);
     }
@@ -707,6 +878,7 @@ function startServer(port) {
 
 // Download queued one-off books without starting a full search cycle.
 async function drainOnly() {
+  authFailed = false;
   const have = await indexLibrary(cfg.library);
   const skip = new Set(await readIds(cfg.dont));
   await drainWant(have, skip);
@@ -741,6 +913,7 @@ async function main() {
   if (cfg.port) startServer(cfg.port);
   log("info", `Nexus archivist ${VERSION}. library=${cfg.library} delay=${cfg.delay}ms query=${status.tags || "(none)"}`);
   log("info", `cookie=${cfg.cookie ? "set" : "not set"} user-agent=${process.env.USER_AGENT ? "custom" : "default"}`);
+  if (!cfg.cookie) log("warn", `COOKIE is not set. Downloads need a logged-in session. ${LOGIN_HELP}`);
   for (;;) {
     if (shuttingDown) break;
     while (paused && !runNow && !wantQueue.length && !shuttingDown) {
