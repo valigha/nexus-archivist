@@ -4,21 +4,15 @@ Unraid/Docker CBZ archivist for HentaiNexus. Same idea as folio-archivist: searc
 
 How it works: the search and gallery pages give the metadata (title, artist, tags). The images come from the site's own zip download (`/zip/<id>`), which needs your login. The zip is turned into a CBZ by adding `ComicInfo.xml`. Blocked tags (lolicon, shotacon, loli, shota, toddlercon) are always skipped.
 
-## Authentication (required)
+## Login and Start
 
-The zip download only works while logged in, so the container needs your session. Put it in the **COOKIE** variable of the Unraid template.
+The zip download only works while logged in. Open the dashboard and use the **Login** box with your HentaiNexus username and password. The password is sent once to the site and is never saved or logged; only the resulting session is stored in the config folder (`session.json`, readable by the container user only). When the session expires the dashboard shows a banner: just log in again, no cookies needed.
 
-1. Log in to hentainexus.com in a browser.
-2. Press F12, open the **Network** tab, and reload the page.
-3. Click the first request (the page itself), find **Request Headers**, and copy the whole value after `Cookie:`.
-4. Paste it into the **COOKIE** variable and apply.
+Nothing runs until you press **Start**. The container always boots stopped. Books you add with **Add a book** download on their own (still respecting the delay), even while stopped.
 
-Notes:
+**Delay between downloads** is set in the dashboard in minutes (default 3). It applies immediately, even in the middle of a wait, so you can raise it quickly if you want to be gentler on your account.
 
-- Paste only the value, not the word `Cookie:`.
-- Treat it like a password. Anyone with it can use your session.
-- It expires. When downloads fail with `LOGIN REQUIRED`, log in again and replace it. The dashboard shows a red banner when this happens.
-- If Cloudflare also blocks the server, set `USER_AGENT` to the exact User-Agent of the same browser, and copy the cookie from a browser on the same network as the server.
+If the site shows a CAPTCHA on its login form, the archivist cannot complete it and the Log will say so.
 
 ## GitHub
 
@@ -30,22 +24,20 @@ Notes:
 
 ## Unraid
 
-Edit `unraid.xml` and make sure the Repository points at your GitHub user. Docker → Add Container → import the XML. Map Library to its own share, not the nhentai folder. Set COOKIE. Open `http://<tower>:8100/`.
+Edit `unraid.xml` and make sure the Repository points at your GitHub user. Docker → Add Container → import the XML. Map Library to its own share, not the nhentai folder. Open `http://<tower>:8100/`, log in, and press Start.
 
-In the dashboard, save a search query (for example `artist:"Aomushi"` or `tag:uncensored`) and press Run now. Or paste a gallery link into Add a book: it downloads right away without waiting for the next cycle.
+In the dashboard, save a search query (for example `artist:"Aomushi"` or `tag:uncensored`) and press Start. Or paste a gallery link into Add a book: it downloads right away without waiting for the next cycle.
 
 ## Settings
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `COOKIE` | empty | Required. Your logged-in Cookie header. |
-| `USER_AGENT` | Chrome | Set to your browser's User-Agent if Cloudflare ties the cookie to it. |
+| `USER_AGENT` | Chrome | Override the browser User-Agent sent to the site. |
 | `HN_TAGS` | empty | Search query. Empty waits for the dashboard. |
 | `SLEEP_INTERVAL` | 3600 | Seconds to wait after a cycle. |
 | `MAX_PER_CYCLE` | 10 | Cap on new CBZs per cycle. 0 = unlimited. |
 | `CATCH_UP_STREAK` | 40 | Stop a cycle after this many already-have galleries in a row. |
 | `REQUEST_DELAY_MS` | 1500 | Pause between page requests. Raise if you see 429. |
-| `ZIP_DELAY_MS` | 5000 | Pause after each zip download. |
 | `ZIP_TIMEOUT_SEC` | 900 | Longest a single zip download may take. |
 | `LIBRARY_SPLIT` | 10000 | Folders of this many ids. 0 = flat. |
 
@@ -59,9 +51,9 @@ docker compose up --build
 
 The dashboard Log box shows the real reason a request failed.
 
-- `LOGIN REQUIRED`: the COOKIE is missing or expired. See Authentication above.
+- `LOGIN REQUIRED`: you are not logged in or the session expired. Log in again from the dashboard.
 - `ENOTFOUND` / `EAI_AGAIN`: the container cannot resolve the site. Check Pi-hole, AdGuard or router blocking, or add `--dns 1.1.1.1` to Extra Parameters.
 - `ENETUNREACH`: often broken IPv6. Add variable `NODE_OPTIONS` = `--dns-result-order=ipv4first`.
 - `ECONNRESET` / `ETIMEDOUT` / `ECONNREFUSED`: a firewall, VPN or the site is dropping the connection.
-- `403` or `Cloudflare challenge`: use a cookie and User-Agent from a browser that can open the site, on the same network as the server.
+- `403` or `Cloudflare challenge`: the site is refusing this server (bot protection or a block). Try a different `USER_AGENT`.
 - `the zip contains no images` or `not a zip file`: the site returned something unexpected. Paste the log line when asking for help.
