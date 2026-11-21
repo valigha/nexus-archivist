@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.2.2";
+const VERSION = "1.2.3";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -42,6 +42,7 @@ const cfg = {
   maxPerCycle: Math.max(0, Number(process.env.MAX_PER_CYCLE) || 10),
   maxPages: Math.max(0, Number(process.env.MAX_SEARCH_PAGES) || 0),
   zipTimeout: Math.max(60, Number(process.env.ZIP_TIMEOUT_SEC) || 900),
+  stall: Math.max(2, Number(process.env.ZIP_STALL_SEC) || 30),
   importKey: process.env.LIBRARY_IMPORT_KEY || "",
   ua: process.env.USER_AGENT
     || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -694,24 +695,44 @@ async function fetchFollow(url, baseHeaders, cookie) {
 }
 
 async function httpFile(url, dest, { referer } = {}) {
-  const headers = {
+  const baseHeaders = {
     "User-Agent": cfg.ua,
     Accept: "application/zip,application/octet-stream,*/*;q=0.8",
     Referer: referer || `${ORIGIN}/`,
   };
   const cookie = session.loggedIn ? jarHeader(session.cookies) : "";
+  const MB = (n) => `${(n / 1048576).toFixed(1)} MB`;
   let last = "no response";
-  for (let i = 0; i < 4; i++) {
+  let fails = 0; // attempts that made no progress; resuming attempts do not count
+  let validator = ""; // ETag / Last-Modified of the file being resumed
+  let got = 0; // bytes already on disk
+  let interruptions = 0;
+  await rm(dest, { force: true });
+  status.downloadDone = 0;
+  status.downloadTotal = 0;
+
+  const fail = (message) => {
+    fails++;
+    last = message;
+    return fails >= 5;
+  };
+
+  for (;;) {
+    if (shuttingDown) throw new Error("shutting down");
     await throttleHtml();
-    status.downloadDone = 0;
-    status.downloadTotal = 0;
+    const headers = { ...baseHeaders };
+    if (got > 0) {
+      headers.Range = `bytes=${got}-`;
+      if (validator) headers["If-Range"] = validator;
+    }
     let res;
     try {
       res = await fetchFollow(url, headers, cookie);
     } catch (err) {
       last = describeError(err);
-      if (isTransient(err) && i < 3) {
-        const pause = Math.min(60_000, 3000 * 2 ** i);
+      if (isTransient(err) && fails < 4) {
+        fails++;
+        const pause = Math.min(60_000, 3000 * 2 ** (fails - 1));
         log("warn", `${last} (${url}) - retrying in ${Math.round(pause / 1000)}s`);
         await wait(pause);
         continue;
@@ -720,15 +741,25 @@ async function httpFile(url, dest, { referer } = {}) {
     }
     absorbSession(res);
     if (res.status === 429 || res.status === 503 || res.status === 502) {
-      const pause = Math.min(120_000, 4000 * 2 ** i);
+      await res.body?.cancel().catch(() => {});
+      if (fail(String(res.status))) throw new Error(`gave up ${url} (${last})`);
+      const pause = Math.min(120_000, 4000 * 2 ** (fails - 1));
       log("warn", `${res.status} ${url} - waiting ${Math.round(pause / 1000)}s`);
       await wait(pause);
-      last = String(res.status);
       continue;
     }
     if (res.status === 401 || res.status === 403) {
       await res.body?.cancel().catch(() => {});
       throw new Error(`LOGIN REQUIRED: ${res.status} from ${url}. Your login may have expired, or the site is blocking this server. ${LOGIN_HELP}`);
+    }
+    if (res.status === 416 && got > 0) {
+      // Our partial file no longer matches what the server has: start over.
+      await res.body?.cancel().catch(() => {});
+      await rm(dest, { force: true });
+      got = 0;
+      validator = "";
+      status.downloadDone = 0;
+      continue;
     }
     if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
     const type = (res.headers.get("content-type") || "").toLowerCase();
@@ -739,20 +770,78 @@ async function httpFile(url, dest, { referer } = {}) {
       }
       throw new Error(`LOGIN REQUIRED: the site returned a web page instead of a zip, so your login has expired. ${LOGIN_HELP}`);
     }
-    status.downloadTotal = Number(res.headers.get("content-length")) || 0;
-    try {
-      const body = Readable.fromWeb(res.body);
-      body.on("data", (chunk) => { status.downloadDone += chunk.length; });
-      await pipeline(body, createWriteStream(dest));
-    } catch (err) {
-      await rm(dest, { force: true });
-      last = describeError(err);
-      if (i < 3 && !shuttingDown) {
-        log("warn", `download interrupted (${last}) - retrying`);
-        await wait(3000 * 2 ** i);
+
+    let resuming = false;
+    if (res.status === 206) {
+      const cr = /^bytes (\d+)-\d+\/(\d+|\*)$/i.exec(res.headers.get("content-range") || "");
+      if (got > 0 && cr && Number(cr[1]) === got) {
+        resuming = true;
+        status.downloadTotal = cr[2] !== "*" ? Number(cr[2]) : 0;
+      } else {
+        await res.body?.cancel().catch(() => {});
+        await rm(dest, { force: true });
+        got = 0;
+        validator = "";
+        if (fail("the server sent a different part of the file than requested")) throw new Error(`gave up ${url} (${last})`);
         continue;
       }
-      throw new Error(`${last} (${url})`);
+    } else {
+      // A full response: anything saved before is replaced.
+      got = 0;
+      status.downloadTotal = Number(res.headers.get("content-length")) || 0;
+    }
+    validator = res.headers.get("etag") || res.headers.get("last-modified") || validator;
+    if (!resuming) {
+      status.downloadDone = 0;
+      log("info", `Downloading #${status.currentId ?? ""}: ${status.downloadTotal ? MB(status.downloadTotal) : "size unknown"}, resume ${res.headers.get("accept-ranges") === "bytes" ? "supported" : "not offered"}`);
+    } else {
+      log("info", `Resuming at ${MB(got)} of ${status.downloadTotal ? MB(status.downloadTotal) : "?"}`);
+    }
+
+    // Abort a transfer that goes quiet instead of waiting for the OS to give up.
+    const body = Readable.fromWeb(res.body);
+    let quiet = null;
+    const arm = () => {
+      clearTimeout(quiet);
+      quiet = setTimeout(() => body.destroy(new Error(`download stalled: no data for ${cfg.stall}s`)), cfg.stall * 1000);
+    };
+    arm();
+    let received = 0;
+    body.on("data", (chunk) => {
+      received += chunk.length;
+      status.downloadDone += chunk.length;
+      arm();
+    });
+    try {
+      await pipeline(body, createWriteStream(dest, { flags: resuming ? "a" : "w" }));
+      clearTimeout(quiet);
+    } catch (err) {
+      clearTimeout(quiet);
+      const size = await stat(dest).then((st) => st.size).catch(() => 0);
+      const reason = describeError(err);
+      const canResume = res.headers.get("accept-ranges") === "bytes" || res.status === 206;
+      interruptions++;
+      // Progress that can be resumed is not a failed attempt; restarting from zero is.
+      if (received > 0 && canResume && interruptions < 40) fails = 0;
+      if (fail(reason)) {
+        await rm(dest, { force: true });
+        throw new Error(`${reason} (${url})`);
+      }
+      got = canResume ? size : 0;
+      if (!got) await rm(dest, { force: true });
+      status.downloadDone = got;
+      const pause = Math.min(60_000, 3000 * 2 ** Math.max(0, fails - 1));
+      log("warn", `download interrupted at ${MB(size)}${status.downloadTotal ? ` of ${MB(status.downloadTotal)}` : ""} (${reason}) - ${got ? "resuming" : "restarting"} in ${Math.round(pause / 1000)}s`);
+      await wait(pause);
+      continue;
+    }
+
+    const size = (await stat(dest)).size;
+    if (status.downloadTotal && size !== status.downloadTotal) {
+      await rm(dest, { force: true });
+      got = 0;
+      if (fail(`the file is ${size} bytes but ${status.downloadTotal} were expected`)) throw new Error(`${last} (${url})`);
+      continue;
     }
     const fh = await open(dest, "r");
     try {
@@ -764,7 +853,6 @@ async function httpFile(url, dest, { referer } = {}) {
     }
     return;
   }
-  throw new Error(`gave up ${url} (${last})`);
 }
 
 const CRC_TABLE = (() => {
