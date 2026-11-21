@@ -5,6 +5,8 @@
  * Does not call /zip/ and does not decrypt the reader payload.
  */
 import { createServer } from "node:http";
+import net from "node:net";
+import dns from "node:dns";
 import { timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile, appendFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
@@ -13,7 +15,13 @@ import { fileURLToPath } from "node:url";
 import JSZip from "jszip";
 
 const ORIGIN = "https://hentainexus.com";
-const VERSION = "1.0.2";
+
+// Node gives each address only 250 ms to connect before trying the next one,
+// and fails with ETIMEDOUT when all of them are slow once. Allow longer, and
+// try IPv4 first because Docker bridge networks usually have no IPv6.
+net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
+dns.setDefaultResultOrder("ipv4first");
+const VERSION = "1.0.3";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -285,12 +293,12 @@ function searchUrl(query, page) {
 function parseSearch(html) {
   const ids = [];
   const seen = new Set();
-  for (const m of html.matchAll(/href="https:\/\/hentainexus\.com\/view\/(\d+)"/g)) {
+  for (const m of html.matchAll(/href="(?:https?:\/\/(?:www\.)?hentainexus\.com)?\/view\/(\d+)(?:[?#][^"]*)?"/g)) {
     const id = Number(m[1]);
     if (!seen.has(id)) { seen.add(id); ids.push(id); }
   }
   let last = 1;
-  for (const m of html.matchAll(/href="https:\/\/hentainexus\.com\/page\/(\d+)\?/g)) last = Math.max(last, Number(m[1]));
+  for (const m of html.matchAll(/href="(?:https?:\/\/(?:www\.)?hentainexus\.com)?\/page\/(\d+)\?/g)) last = Math.max(last, Number(m[1]));
   return { ids, last };
 }
 
@@ -329,7 +337,8 @@ function parseGallery(html, id) {
 }
 
 function imageUrl(html) {
-  const urls = [...html.matchAll(/https:\/\/images\.hentainexus\.com\/[^"'\s<>]+/g)].map((m) => m[0]);
+  const urls = [...html.matchAll(/(?:https?:)?\/\/images\.hentainexus\.com\/[^"'\s<>]+/g)]
+    .map((m) => (m[0].startsWith("//") ? `https:${m[0]}` : m[0]));
   return urls.find((u) => !u.includes(".thumb.")) || null;
 }
 
