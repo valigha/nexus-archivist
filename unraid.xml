@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>nexus-archivist</Name>
-  <Repository>ghcr.io/YOUR_USER/nexus-archivist:latest</Repository>
+  <Repository>ghcr.io/valigha/nexus-archivist:latest</Repository>
   <Registry>https://ghcr.io/</Registry>
   <Network>bridge</Network>
   <Shell>sh</Shell>
