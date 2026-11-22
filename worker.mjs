@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.3.1";
+const VERSION = "1.3.2";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -1226,7 +1226,14 @@ async function searchCycle(have, skip) {
     status.searchPages = last;
     status.state = "searching";
     status.message = limit && limit < last ? `Search page ${page} / ${limit} (${last} available)` : `Search page ${page} / ${last}`;
-    if (!parsed.ids.length) return;
+    if (!parsed.ids.length) {
+      const title = decode((html.match(/<title>([\s\S]*?)<\/title>/i) || [])[1] || "");
+      const views = (html.match(/\/view\/\d+/g) || []).length;
+      const text = decode(html.replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ")).slice(0, 240);
+      log("warn", `Search page ${page} had no galleries I could read. Page title "${title}", ${html.length} bytes, ${views} "/view/" links. Page text: ${text}`);
+      status.message = "The search found no galleries (see the Log)";
+      return;
+    }
     if (parsed.ids[0] === prevFirst) return;
     prevFirst = parsed.ids[0];
     log("info", `Search page ${page}/${last} — ${parsed.ids.length} galleries`);
