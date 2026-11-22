@@ -47,4 +47,9 @@ jobs:
             echo; echo "---"
             echo "Docker image: \`ghcr.io/${GITHUB_REPOSITORY}:$V\`"
           } >> notes.md
-          gh release create "v$V" --target "$SHA" --title "v$V" --notes-file notes.md
+          echo "Tagging $SHA as v$V"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$V" "$SHA" -m "v$V"
+          git push origin "refs/tags/v$V"
+          gh release create "v$V" --verify-tag --title "v$V" --notes-file notes.md
