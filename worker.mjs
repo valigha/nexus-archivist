@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.4.0";
+const VERSION = "1.4.1";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -684,8 +684,11 @@ function comicInfo(g) {
 
 const idPattern = new RegExp(`^${cfg.prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\d+)\\b`);
 
+let indexOther = 0; // .cbz files that are not ours (for example folio's), counted but left alone
+
 async function indexLibrary(root) {
   const ids = new Set();
+  indexOther = 0;
   async function scan(dir, depth) {
     let entries;
     try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
@@ -695,11 +698,27 @@ async function indexLibrary(root) {
       else if (entry.isFile() && entry.name.toLowerCase().endsWith(".cbz")) {
         const m = entry.name.match(idPattern);
         if (m) ids.add(Number(m[1]));
+        else indexOther += 1;
       }
     }
   }
   await scan(root, 0);
   return ids;
+}
+
+// Counts the library once at startup (in the background) so the dashboard is right
+// before anything is started. Large libraries can take a few minutes.
+async function scanLibraryAtBoot() {
+  const t0 = Date.now();
+  log("info", `Scanning library ${cfg.library} ...`);
+  try {
+    const have = await indexLibrary(cfg.library);
+    status.libraryCount = have.size;
+    log("info", `Library: ${have.size} ${cfg.prefix ? cfg.prefix + " " : ""}book(s) found in ${((Date.now() - t0) / 1000).toFixed(1)}s; ${indexOther} other .cbz file(s) left alone`);
+    if (!have.size && !indexOther) log("warn", `Nothing found in ${cfg.library}. If your books are elsewhere, change the Library path in the container settings.`);
+  } catch (err) {
+    log("warn", `Library scan failed: ${describeError(err)}`);
+  }
 }
 
 async function readIds(path) {
@@ -1669,6 +1688,7 @@ async function main() {
   log("info", `Nexus archivist ${VERSION}. library=${cfg.library} delay=${cfg.delay}ms query=${status.tags || "(none)"}`);
   log("info", `Files are named ${cfg.prefix}<id> <title>.cbz${cfg.prefix ? "" : " (no prefix: do not share this folder with another site's tool)"}`);
   log("info", `login=${session.loggedIn ? `saved session for ${session.user}` : session.expired ? "expired" : "not logged in"} download-delay=${fmtDuration(downloadDelaySec * 1000)} user-agent=${process.env.USER_AGENT ? "custom" : "default"}`);
+  scanLibraryAtBoot();
   if (skippedFilters.length) log("warn", `Ignored filters the site cannot search: ${[...new Set(skippedFilters)].join(", ")}`);
   log("info", "Stopped. Log in, set a search query, then press Start.");
   status.message = "Stopped. Log in, set a search query, then press Start.";
