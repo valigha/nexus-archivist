@@ -14,6 +14,12 @@ Nothing runs until you press **Start**. The container always boots stopped. Book
 
 If the site shows a CAPTCHA on its login form, the archivist cannot complete it and the Log will say so.
 
+## Search chips and page limit
+
+The Search query box works like folio's. Type in the box and pick a suggestion, then **Include** or **Exclude** it. Suggestions come from the site's own lists (tags, artists, authors, circles, events, magazines, parodies, publishers), with how often each is used. Anything the list does not have can still be added as typed, and **title** and **description** chips search those fields. The line under the chips shows the exact search that is sent, including the blocked-tag excludes that are always added. Chips save instantly.
+
+**Each run, search only the newest N pages** sets how many result pages are searched every run. The box shows how many pages the site has for your search. `0` means every page. The default is 10.
+
 ## GitHub
 
 1. Create an empty repo named `nexus-archivist` (no generated README).

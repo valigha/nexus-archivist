@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.2.5";
+const VERSION = "1.3.0";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -40,7 +40,6 @@ const cfg = {
   delay: Math.max(200, Number(process.env.REQUEST_DELAY_MS) || 1500),
   streakCap: Math.max(0, Number(process.env.CATCH_UP_STREAK) || 40),
   maxPerCycle: Math.max(0, Number(process.env.MAX_PER_CYCLE) || 10),
-  maxPages: Math.max(0, Number(process.env.MAX_SEARCH_PAGES) || 0),
   zipTimeout: Math.max(60, Number(process.env.ZIP_TIMEOUT_SEC) || 900),
   cooldown: Math.max(1, Number(process.env.ZIP_COOLDOWN_SEC) || 120),
   stall: Math.max(2, Number(process.env.ZIP_STALL_SEC) || 30),
@@ -77,13 +76,64 @@ const status = {
   login: { loggedIn: false, expired: false, user: "", since: null },
   tagsInput: "",
   tags: "",
+  chips: [],
+  pageLimit: 10,
+  searchLimit: 0,
+  wantBatch: { total: 0, done: 0 },
+  wantRecent: [],
+  cycleStartedAt: null,
   sleepUntil: null,
   wantQueue: [],
   recent: [],
   startedAt: new Date().toISOString(),
 };
 
-let liveTags = (process.env.HN_TAGS || "").trim();
+// Search query chips. Prefixes are the ones the site's search understands.
+const CHIP_TYPES = ["tag", "artist", "author", "circle", "event", "magazine", "parody", "publisher", "title", "description"];
+const SUGGEST_TYPES = ["tag", "artist", "author", "circle", "event", "magazine", "parody", "publisher"];
+
+function chipTerm(c) {
+  const v = /^[A-Za-z0-9_-]+$/.test(c.value) ? c.value : `"${c.value}"`;
+  return `${c.not ? "-" : ""}${c.type}:${v}`;
+}
+
+function chipsToQuery(chips) {
+  return chips.map(chipTerm).join(" ");
+}
+
+// Turns an old free-text query (or HN_TAGS) into chips. Bare words are tags.
+function parseQueryToChips(text) {
+  const out = [];
+  for (const m of String(text || "").matchAll(/(-?)(?:([a-z]+):)?("([^"]*)"|[^\s"]+)/gi)) {
+    const type = (m[2] || "tag").toLowerCase();
+    const value = (m[4] ?? m[3] ?? "").trim();
+    if (CHIP_TYPES.includes(type) && value) out.push({ type, value, not: m[1] === "-" });
+  }
+  return cleanChips(out) || [];
+}
+
+// Returns a clean list, or null when the input is not acceptable.
+function cleanChips(list) {
+  if (!Array.isArray(list) || list.length > 60) return null;
+  const seen = new Map();
+  for (const c of list) {
+    if (!c || typeof c !== "object") return null;
+    const type = String(c.type || "").toLowerCase();
+    const value = String(c.value ?? "").replace(/\s+/g, " ").trim();
+    if (!CHIP_TYPES.includes(type)) return null;
+    if (!value || value.length > 100 || /["\u0000-\u001f]/.test(value)) return null;
+    seen.set(`${type}:${value.toLowerCase()}`, { type, value, not: c.not === true });
+  }
+  return [...seen.values()];
+}
+
+let liveChips = parseQueryToChips(process.env.HN_TAGS || "");
+let liveTags = chipsToQuery(liveChips);
+// Search only the newest N pages each cycle; 0 means every page the site has.
+const envPages = process.env.MAX_SEARCH_PAGES;
+let pageLimit = envPages !== undefined && envPages !== "" ? Math.max(0, Math.floor(Number(envPages)) || 0) : 10;
+let wantBatch = { total: 0, done: 0 };
+let wantRecent = [];
 // Nothing runs until the user presses Start in the dashboard.
 let paused = true;
 let queueArmed = false;
@@ -184,8 +234,9 @@ function wake() {
 
 function withSafety(query) {
   const q = String(query || "").trim();
+  const plain = q.toLowerCase().replace(/"/g, "");
   const extras = ["lolicon", "shotacon", "loli", "shota", "toddlercon"]
-    .filter((t) => !q.toLowerCase().includes(`-tag:${t}`))
+    .filter((t) => !new RegExp(`-tag:${t}(\\s|$)`).test(plain))
     .map((t) => `-tag:${t}`);
   return [q, ...extras].filter(Boolean).join(" ");
 }
@@ -215,6 +266,10 @@ function sync() {
   status.login = { loggedIn: session.loggedIn, expired: session.expired, user: session.user, since: session.at };
   status.tagsInput = liveTags;
   status.tags = liveTags ? withSafety(liveTags) : "";
+  status.chips = liveChips;
+  status.pageLimit = pageLimit;
+  status.wantBatch = wantBatch;
+  status.wantRecent = wantRecent;
   status.wantQueue = [...wantQueue];
 }
 
@@ -222,7 +277,7 @@ async function saveLive() {
   sync();
   try {
     await mkdir(dirname(livePath), { recursive: true });
-    await writeFile(livePath, JSON.stringify({ tags: liveTags, wantQueue, downloadDelaySec }, null, 2) + "\n");
+    await writeFile(livePath, JSON.stringify({ chips: liveChips, pageLimit, wantQueue, downloadDelaySec }, null, 2) + "\n");
   } catch (err) {
     log("warn", `could not save nexus.json: ${err instanceof Error ? err.message : err}`);
   }
@@ -231,7 +286,13 @@ async function saveLive() {
 function loadLive() {
   try {
     const j = JSON.parse(readFileSync(livePath, "utf8"));
-    if (typeof j.tags === "string") liveTags = j.tags.trim();
+    if (Array.isArray(j.chips)) {
+      liveChips = cleanChips(j.chips) || [];
+    } else if (typeof j.tags === "string") {
+      liveChips = parseQueryToChips(j.tags); // saved by an older version as text
+    }
+    liveTags = chipsToQuery(liveChips);
+    if (Number.isInteger(j.pageLimit) && j.pageLimit >= 0 && j.pageLimit <= 5000) pageLimit = j.pageLimit;
     if (typeof j.downloadDelaySec === "number" && j.downloadDelaySec >= 0 && j.downloadDelaySec <= 86400) downloadDelaySec = Math.round(j.downloadDelaySec);
     if (Array.isArray(j.wantQueue)) wantQueue = j.wantQueue.map(Number).filter((n) => Number.isInteger(n) && n > 0);
   } catch { /* first boot */ }
@@ -1119,6 +1180,9 @@ async function drainWant(have, skip) {
         break;
       }
       wantQueue.shift();
+      wantBatch.done += 1;
+      wantRecent.unshift({ id, result: outcome, title: status.currentTitle || "", at: new Date().toISOString() });
+      if (wantRecent.length > 20) wantRecent.length = 20;
       if (authFailed && wantQueue.length) {
         log("warn", `Login required: dropped ${wantQueue.length} more queued book(s). Log in again from the dashboard and queue them again.`);
         wantQueue.length = 0;
@@ -1139,16 +1203,22 @@ async function searchCycle(have, skip) {
   let streak = 0;
   let added = 0;
   let prevFirst = null;
+  const limit = pageLimit;
+  status.searchLimit = limit;
   while (page <= last && !shuttingDown) {
     if (paused && !runNow) { log("info", "Paused"); return; }
-    if (cfg.maxPages && page > cfg.maxPages) return;
+    if (limit && page > limit) {
+      log("info", `Page limit reached: searched the newest ${limit} of ${last} pages`);
+      status.message = `Searched the newest ${limit} of ${last} pages`;
+      return;
+    }
     const html = await http(searchUrl(query, page));
     const parsed = parseSearch(html);
     last = Math.max(last, parsed.last);
     status.searchPage = page;
     status.searchPages = last;
     status.state = "searching";
-    status.message = `Search page ${page} / ${last}`;
+    status.message = limit && limit < last ? `Search page ${page} / ${limit} (${last} available)` : `Search page ${page} / ${last}`;
     if (!parsed.ids.length) return;
     if (parsed.ids[0] === prevFirst) return;
     prevFirst = parsed.ids[0];
@@ -1188,6 +1258,7 @@ async function runCycle() {
   status.failedThisCycle = 0;
   status.blockedThisCycle = 0;
   status.sleepUntil = null;
+  status.cycleStartedAt = new Date().toISOString();
   status.state = "searching";
   const have = await indexLibrary(cfg.library);
   const skip = new Set(await readIds(cfg.dont));
@@ -1263,6 +1334,87 @@ function parseWant(text) {
   return ids;
 }
 
+// Tag / artist / ... suggestions come from the site's own category pages.
+const categoryCache = new Map();
+const categoryLoading = new Map();
+let suggestBusy = false;
+
+function parseCategory(html) {
+  const items = [];
+  const seen = new Set();
+  for (const m of html.matchAll(/<a\b[^>]*\bhref="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi)) {
+    let q;
+    try { q = new URL(unescapeAttr(m[1]), ORIGIN).searchParams.get("q"); } catch { continue; }
+    const mm = q && /^([a-z]+):(.+)$/i.exec(q.trim());
+    if (!mm) continue;
+    const type = mm[1].toLowerCase();
+    if (!CHIP_TYPES.includes(type)) continue;
+    const name = mm[2].trim().replace(/^"(.*)"$/, "$1").trim();
+    if (!name || name.length > 100 || seen.has(`${type}:${name.toLowerCase()}`)) continue;
+    seen.add(`${type}:${name.toLowerCase()}`);
+    const cm = /\(used ([\d,]+) times?\)/i.exec(decode(m[2]));
+    items.push({ type, name, count: cm ? Number(cm[1].replace(/,/g, "")) : 0 });
+  }
+  return items;
+}
+
+const categoryFresh = (type) => {
+  const hit = categoryCache.get(type);
+  return !!hit && Date.now() - hit.at < 6 * 3600_000;
+};
+
+async function loadCategory(type) {
+  if (categoryFresh(type)) return categoryCache.get(type).items;
+  if (categoryLoading.has(type)) return categoryLoading.get(type);
+  const p = (async () => {
+    try {
+      const items = parseCategory(await http(`${ORIGIN}/explore/categories/${type}`));
+      categoryCache.set(type, { at: Date.now(), items });
+      log("info", `Loaded ${items.length} ${type} suggestions`);
+      return items;
+    } finally {
+      categoryLoading.delete(type);
+    }
+  })();
+  categoryLoading.set(type, p);
+  return p;
+}
+
+async function suggest(q, typeParam) {
+  const wanted = SUGGEST_TYPES.includes(typeParam) ? [typeParam] : SUGGEST_TYPES;
+  const missing = wanted.filter((t) => !categoryFresh(t));
+  let error = "";
+  let loading = false;
+  if (missing.length) {
+    if (wanted.length === 1) {
+      try {
+        await Promise.race([loadCategory(missing[0]), wait(20_000).then(() => { throw new Error("the site is slow to answer"); })]);
+      } catch (err) {
+        error = describeError(err);
+      }
+      loading = !categoryFresh(missing[0]) && !error;
+    } else {
+      loading = true;
+      if (!suggestBusy) {
+        suggestBusy = true;
+        (async () => {
+          for (const t of missing) await loadCategory(t).catch((err) => log("warn", `suggestions for ${t}: ${describeError(err)}`));
+        })().finally(() => { suggestBusy = false; });
+      }
+    }
+  }
+  const needle = q.toLowerCase();
+  const rows = [];
+  if (needle) {
+    for (const t of wanted) for (const it of categoryCache.get(t)?.items || []) {
+      const name = it.name.toLowerCase();
+      if (name.includes(needle)) rows.push({ ...it, rank: name.startsWith(needle) ? 0 : 1 });
+    }
+  }
+  rows.sort((a, b) => a.rank - b.rank || b.count - a.count || a.name.localeCompare(b.name));
+  return { result: rows.slice(0, 20).map(({ rank, ...r }) => r), loading, error };
+}
+
 function startServer(port) {
   let page = "<p>dashboard.html missing</p>";
   for (const p of [join(HERE, "dashboard.html"), "/app/dashboard.html"]) {
@@ -1298,12 +1450,28 @@ function startServer(port) {
       }).catch((err) => json(res, 400, { error: err.message }));
       return;
     }
+    if (url.pathname === "/api/tags") {
+      const q = (url.searchParams.get("q") || "").trim().slice(0, 100);
+      suggest(q, url.searchParams.get("type") || "all")
+        .then((out) => json(res, 200, out))
+        .catch((err) => json(res, 200, { result: [], loading: false, error: describeError(err) }));
+      return;
+    }
     if (url.pathname === "/api/config" && req.method === "POST") {
       readBody(req).then(async (body) => {
-        const tags = String(body.tags ?? "").trim();
-        if (tags.length > 500) return json(res, 400, { error: "query too long" });
-        liveTags = tags;
-        log("info", `Query saved: ${tags || "(empty)"}`);
+        if (body.chips !== undefined || body.tags !== undefined) {
+          const chips = body.chips !== undefined ? cleanChips(body.chips) : parseQueryToChips(String(body.tags ?? "").slice(0, 500));
+          if (!chips) return json(res, 400, { error: "Those filters are not valid (up to 60, values up to 100 characters, no quote marks)." });
+          liveChips = chips;
+          liveTags = chipsToQuery(chips);
+          log("info", `Query saved: ${liveTags || "(empty)"}`);
+        }
+        if (body.pageLimit !== undefined) {
+          const n = Number(body.pageLimit);
+          if (!Number.isInteger(n) || n < 0 || n > 5000) return json(res, 400, { error: "Enter a whole number of pages, 0 or more (0 = all pages)." });
+          pageLimit = n;
+          log("info", `Page limit set to ${n || "all pages"}`);
+        }
         await saveLive();
         json(res, 200, snapshot());
       }).catch((err) => json(res, 400, { error: err.message }));
@@ -1369,7 +1537,11 @@ function startServer(port) {
         if (!session.loggedIn && !cfg.dry) return json(res, 400, { error: "Log in first." });
         const ids = parseWant(body.text);
         if (!ids.length) return json(res, 400, { error: "Paste a hentainexus.com/view/… link or an id" });
-        for (const id of ids) if (!wantQueue.includes(id) && wantQueue.length < 500) wantQueue.push(id);
+        const wasEmpty = wantQueue.length === 0;
+        let fresh = 0;
+        for (const id of ids) if (!wantQueue.includes(id) && wantQueue.length < 500) { wantQueue.push(id); fresh++; }
+        if (wasEmpty) wantBatch = { total: fresh, done: 0 };
+        else wantBatch = { total: wantBatch.total + fresh, done: wantBatch.done };
         log("info", `Queued ${ids.join(", ")}`);
         queueArmed = true;
         await saveLive();
