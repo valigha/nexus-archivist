@@ -6,10 +6,14 @@ Every release is kept as its own image tag, so you can go back to an earlier one
 | Unraid Repository | Meaning |
 | --- | --- |
 | `ghcr.io/valigha/nexus-archivist:latest` | newest, may change |
-| `ghcr.io/valigha/nexus-archivist:1.5.0` | that release, frozen |
-| `ghcr.io/valigha/nexus-archivist:v1.5.0` | same image, `v` prefix |
+| `ghcr.io/valigha/nexus-archivist:1.5.1` | that release, frozen |
+| `ghcr.io/valigha/nexus-archivist:v1.5.1` | same image, `v` prefix |
 
 To roll back: Unraid → Docker → edit the container → set **Repository** to the older version tag → Apply. Your settings, session and library are untouched. The code for each release is kept on a `release/vX.Y.Z` branch.
+
+## 1.5.1
+
+- A GitHub Release (with notes from this file) is now created automatically for every version
 
 ## 1.5.0
 
