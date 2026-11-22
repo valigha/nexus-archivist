@@ -447,6 +447,8 @@
     .delay-input { width: 96px; margin: 0; }
     .controls button.stop { background: var(--danger); border-color: var(--danger); color: #0b0c0e; font-weight: 600; }
     .badge.waiting { color: var(--warn); }
+    .chip.warnchip { border-color: var(--warn); }
+    .chip-warn { color: var(--warn); font-size: 13px; margin: 10px 0 0; }
     .badge.stopped { color: var(--muted); }
     .suggest li.custom { grid-template-columns: 1fr auto auto; }
     .suggest li.note { display: block; color: var(--muted); }
@@ -521,6 +523,7 @@
       <h2>Search query</h2>
       <p class="now-meta">Chips are filters. Include or exclude tags, artists, magazines and more from the site's own lists. Saved instantly. Press Start (or Run now) to use them.</p>
       <div class="chips" id="chips"></div>
+      <p class="chip-warn hidden" id="chipWarn"></p>
       <div class="search-row">
         <select id="tagType" aria-label="Filter type">
           <option value="all">All types</option>
@@ -768,12 +771,17 @@
 
     function paintChips() {
       const list = data.chips || [];
+      const problems = {};
+      (data.chipProblems || []).forEach((pr) => { problems[pr.index] = pr; });
+      const warn = (data.chipProblems || []).map((pr) => pr.message).join(" ");
+      $("chipWarn").textContent = warn ? "Check this: " + warn : "";
+      $("chipWarn").classList.toggle("hidden", !warn);
       const el = $("chips");
       if (!list.length) {
         el.innerHTML = '<span class="empty">No chips yet. Search below and Include / Exclude.</span>';
       } else {
         el.innerHTML = list.map((c, i) =>
-          '<span class="chip' + (c.not ? " ex" : "") + '"><span class="ns">' + (c.not ? "not " : "") + esc(c.type) + "</span><span>"
+          '<span class="chip' + (c.not ? " ex" : "") + (problems[i] ? " warnchip" : "") + '"' + (problems[i] ? ' title="' + esc(problems[i].message) + '"' : "") + '><span class="ns">' + (c.not ? "not " : "") + esc(c.type) + "</span><span>"
           + esc(c.value) + '</span><button type="button" data-rm="' + i + '" aria-label="Remove">×</button></span>'
         ).join("");
         el.querySelectorAll("[data-rm]").forEach((btn) => btn.addEventListener("click", () => {
@@ -900,7 +908,7 @@
     }
 
     // ---- suggestions
-    let suggestTimer = 0, suggestTries = 0;
+    let suggestTimer = 0, suggestTries = 0, lastRows = [];
     function addChip(type, value, not) {
       const next = (data.chips || []).filter((c) => !(c.type === type && c.value.toLowerCase() === value.toLowerCase()));
       next.push({ type, value, not });
@@ -926,7 +934,9 @@
         '<li><span><span class="ns">' + esc(t.type) + "</span> " + esc(t.name) + '</span><span class="count">' + Number(t.count || 0).toLocaleString()
         + '</span><button type="button" data-t="' + esc(t.type) + '" data-n="' + esc(t.name) + '">Include</button><button type="button" class="ex" data-t="' + esc(t.type) + '" data-n="' + esc(t.name) + '" data-ex="1">Exclude</button></li>'
       );
-      rows.push('<li class="custom"><span>Use “' + esc(q) + '” as <span class="ns">' + esc(customType) + '</span></span><button type="button" data-t="' + esc(customType) + '" data-n="' + esc(q) + '">Include</button><button type="button" class="ex" data-t="' + esc(customType) + '" data-n="' + esc(q) + '" data-ex="1">Exclude</button></li>');
+      lastRows = out.result || [];
+      const loose = type === "all";
+      if (!loose || !lastRows.length) rows.push('<li class="custom"><span>' + (loose ? "Add" : "Use") + " “" + esc(q) + "” as " + (loose ? "a " : "") + '<span class="ns">' + esc(customType) + "</span>" + (loose ? " anyway" : "") + '</span><button type="button" data-t="' + esc(customType) + '" data-n="' + esc(q) + '">Include</button><button type="button" class="ex" data-t="' + esc(customType) + '" data-n="' + esc(q) + '" data-ex="1">Exclude</button></li>');
       if (out.loading) rows.push('<li class="note">Loading the site’s lists…</li>');
       else if (out.error) rows.push('<li class="note">Could not load the list (' + esc(out.error) + "). You can still add what you typed.</li>");
       box.innerHTML = rows.join("");
@@ -939,7 +949,15 @@
     $("tagQ").addEventListener("input", () => { suggestTries = 0; clearTimeout(suggestTimer); suggestTimer = setTimeout(searchTags, 300); });
     $("tagType").addEventListener("change", () => { suggestTries = 0; if ($("tagQ").value.trim()) searchTags(); });
     $("tagQ").addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { e.preventDefault(); const v = $("tagQ").value.trim(); if (v) addChip($("tagType").value === "all" ? "tag" : $("tagType").value, v, false); }
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      const v = $("tagQ").value.trim();
+      if (!v) return;
+      const type = $("tagType").value;
+      if (type !== "all") { addChip(type, v, false); return; }
+      const exact = lastRows.find((r) => r.name.toLowerCase() === v.toLowerCase());
+      if (exact) addChip(exact.type, exact.name, false);
+      else hint("Pick one of the suggestions, or choose a type first.")
     });
     document.addEventListener("click", (e) => {
       if (!$("suggest").contains(e.target) && e.target !== $("tagQ")) $("suggest").classList.remove("open");

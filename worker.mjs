@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.3.2";
+const VERSION = "1.3.3";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -77,6 +77,7 @@ const status = {
   tagsInput: "",
   tags: "",
   chips: [],
+  chipProblems: [],
   pageLimit: 10,
   searchLimit: 0,
   wantBatch: { total: 0, done: 0 },
@@ -274,6 +275,7 @@ function sync() {
   status.tagsInput = liveTags;
   status.tags = liveTags ? withSafety(liveTags) : "";
   status.chips = liveChips;
+  status.chipProblems = chipProblems();
   status.pageLimit = pageLimit;
   status.wantBatch = wantBatch;
   status.wantRecent = wantRecent;
@@ -1231,7 +1233,9 @@ async function searchCycle(have, skip) {
       const views = (html.match(/\/view\/\d+/g) || []).length;
       const text = decode(html.replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ")).slice(0, 240);
       log("warn", `Search page ${page} had no galleries I could read. Page title "${title}", ${html.length} bytes, ${views} "/view/" links. Page text: ${text}`);
-      status.message = "The search found no galleries (see the Log)";
+      const why = chipProblems().map((pr) => pr.message).join(" ");
+      if (why) log("warn", `Likely cause: ${why}`);
+      status.message = why ? `The search found no galleries. ${chipProblems()[0].message}` : "The search found no galleries (see the Log)";
       return;
     }
     if (parsed.ids[0] === prevFirst) return;
@@ -1288,7 +1292,11 @@ async function runCycle() {
       await takeOne(id, have, skip);
     }
   }
-  if (liveTags && !shuttingDown && !(paused && !runNow)) await searchCycle(have, skip);
+  if (liveTags && !shuttingDown && !(paused && !runNow)) {
+    await checkChips();
+    for (const pr of chipProblems()) log("warn", `Filter check: ${pr.message}`);
+    await searchCycle(have, skip);
+  }
   if (!liveTags && !listed.length && !wantQueue.length) {
     status.state = "stopped";
     status.message = "No search query yet. Set one, then press Start.";
@@ -1346,6 +1354,39 @@ function parseWant(text) {
   for (const m of raw.matchAll(/hentainexus\.com\/(?:view|read)\/(\d+)/gi)) add(m[1]);
   for (const line of raw.split(/[\s,;]+/)) if (/^\d+$/.test(line)) add(line);
   return ids;
+}
+
+// An include chip whose name is not in the site's list for that type finds
+// nothing (for example "fakku" is a publisher, not a tag). Uses the cached lists.
+function chipProblems() {
+  const out = [];
+  const has = (items, v) => items.some((it) => it.name.toLowerCase() === v.toLowerCase());
+  liveChips.forEach((c, index) => {
+    if (c.not || !SUGGEST_TYPES.includes(c.type)) return;
+    const own = categoryCache.get(c.type);
+    if (!own || own.items.length < 5 || has(own.items, c.value)) return;
+    const elsewhere = SUGGEST_TYPES.filter((t) => t !== c.type && categoryCache.get(t) && has(categoryCache.get(t).items, c.value));
+    out.push({
+      index,
+      elsewhere,
+      message: `“${c.value}” is not in the site's ${c.type} list` + (elsewhere.length ? `, but it is a ${elsewhere.join(" and a ")}. Use ${elsewhere[0]}:${c.value} instead.` : ", so this filter will probably find nothing."),
+    });
+  });
+  return out;
+}
+
+let checkBusy = false;
+// Loads the lists needed to check the include chips (and the rest, if one looks wrong).
+async function checkChips() {
+  if (checkBusy) return;
+  checkBusy = true;
+  try {
+    const types = [...new Set(liveChips.filter((c) => !c.not && SUGGEST_TYPES.includes(c.type)).map((c) => c.type))];
+    for (const t of types) await loadCategory(t).catch(() => {});
+    if (chipProblems().length) for (const t of SUGGEST_TYPES) await loadCategory(t).catch(() => {});
+  } finally {
+    checkBusy = false;
+  }
 }
 
 // Tag / artist / ... suggestions come from the site's own category pages.
@@ -1479,6 +1520,7 @@ function startServer(port) {
           liveChips = chips;
           liveTags = chipsToQuery(chips);
           log("info", `Query saved: ${liveTags || "(empty)"}`);
+          checkChips().catch(() => {});
         }
         if (body.pageLimit !== undefined) {
           const n = Number(body.pageLimit);
