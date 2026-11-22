@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.3.0";
+const VERSION = "1.3.1";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -102,12 +102,18 @@ function chipsToQuery(chips) {
 }
 
 // Turns an old free-text query (or HN_TAGS) into chips. Bare words are tags.
-function parseQueryToChips(text) {
+// Also accepts a bracketed, comma-separated list such as
+// [language:"english", -tag:"unbirth"]. Filters the site cannot search (for
+// example language:) are left out and their names are added to `skipped`.
+function parseQueryToChips(text, skipped = []) {
   const out = [];
-  for (const m of String(text || "").matchAll(/(-?)(?:([a-z]+):)?("([^"]*)"|[^\s"]+)/gi)) {
+  const cleaned = String(text || "").replace(/("[^"]*")|[\[\],]/g, (m, quoted) => quoted || " ");
+  for (const m of cleaned.matchAll(/(-?)(?:([a-z]+):)?("([^"]*)"|[^\s"]+)/gi)) {
     const type = (m[2] || "tag").toLowerCase();
     const value = (m[4] ?? m[3] ?? "").trim();
-    if (CHIP_TYPES.includes(type) && value) out.push({ type, value, not: m[1] === "-" });
+    if (!value || !/[\p{L}\p{N}]/u.test(value)) continue;
+    if (!CHIP_TYPES.includes(type)) { skipped.push(`${type}:${value}`); continue; }
+    out.push({ type, value, not: m[1] === "-" });
   }
   return cleanChips(out) || [];
 }
@@ -127,7 +133,8 @@ function cleanChips(list) {
   return [...seen.values()];
 }
 
-let liveChips = parseQueryToChips(process.env.HN_TAGS || "");
+const skippedFilters = [];
+let liveChips = parseQueryToChips(process.env.HN_TAGS || "", skippedFilters);
 let liveTags = chipsToQuery(liveChips);
 // Search only the newest N pages each cycle; 0 means every page the site has.
 const envPages = process.env.MAX_SEARCH_PAGES;
@@ -289,7 +296,7 @@ function loadLive() {
     if (Array.isArray(j.chips)) {
       liveChips = cleanChips(j.chips) || [];
     } else if (typeof j.tags === "string") {
-      liveChips = parseQueryToChips(j.tags); // saved by an older version as text
+      liveChips = parseQueryToChips(j.tags, skippedFilters); // saved by an older version as text
     }
     liveTags = chipsToQuery(liveChips);
     if (Number.isInteger(j.pageLimit) && j.pageLimit >= 0 && j.pageLimit <= 5000) pageLimit = j.pageLimit;
@@ -1607,6 +1614,7 @@ async function main() {
   if (cfg.port) startServer(cfg.port);
   log("info", `Nexus archivist ${VERSION}. library=${cfg.library} delay=${cfg.delay}ms query=${status.tags || "(none)"}`);
   log("info", `login=${session.loggedIn ? `saved session for ${session.user}` : session.expired ? "expired" : "not logged in"} download-delay=${fmtDuration(downloadDelaySec * 1000)} user-agent=${process.env.USER_AGENT ? "custom" : "default"}`);
+  if (skippedFilters.length) log("warn", `Ignored filters the site cannot search: ${[...new Set(skippedFilters)].join(", ")}`);
   log("info", "Stopped. Log in, set a search query, then press Start.");
   status.message = "Stopped. Log in, set a search query, then press Start.";
   for (;;) {

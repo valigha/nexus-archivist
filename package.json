@@ -2,7 +2,7 @@
   "name": "nexus-archivist",
   "private": true,
   "type": "module",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Unraid/Docker HentaiNexus CBZ archivist",
   "scripts": {
     "start": "node worker.mjs"
