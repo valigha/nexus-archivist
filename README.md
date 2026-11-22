@@ -20,6 +20,12 @@ The Search query box works like folio's. Type in the box and pick a suggestion, 
 
 **Each run, search only the newest N pages** sets how many result pages are searched every run. The box shows how many pages the site has for your search. `0` means every page. The default is 10.
 
+## Sharing a folder with folio
+
+You can point this and folio at the same library folder. Each tool decides "already have it" from the number at the start of a file name, and the two sites use overlapping numbers, so this tool names its files `HN22433 Title.cbz`. Folio ignores names that do not start with a digit, and this tool only counts names that start with `HN`, so neither skips or overwrites the other's books. Keep the default `FILE_PREFIX=HN`. An empty prefix brings the collisions back.
+
+Files written by an earlier version have no prefix (`22433 Title.cbz`) and are not recognised, so rename them to `HN22433 Title.cbz` or they will be downloaded again.
+
 ## GitHub
 
 1. Create an empty repo named `nexus-archivist` (no generated README).
@@ -38,6 +44,7 @@ In the dashboard, save a search query (for example `artist:"Aomushi"` or `tag:un
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `FILE_PREFIX` | HN | Prefix on file names, so a folder shared with folio never mixes up ids. |
 | `USER_AGENT` | Chrome | Override the browser User-Agent sent to the site. |
 | `HN_TAGS` | empty | Optional starting filters, space separated (`tag:uncensored -tag:unbirth`). The dashboard chips replace it once saved. The site has no `language:` search. |
 | `SLEEP_INTERVAL` | 3600 | Seconds to wait after a cycle. |
