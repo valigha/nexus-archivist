@@ -54,6 +54,10 @@ In the dashboard, save a search query (for example `artist:"Aomushi"` or `tag:un
 | `ZIP_TIMEOUT_SEC` | 900 | Longest a single zip download may take. |
 | `LIBRARY_SPLIT` | 10000 | Folders of this many ids. 0 = flat. |
 
+## Updating and rolling back
+
+Every version is published as its own image tag (see CHANGELOG.md), and `latest` moves to the newest. To go back to an earlier version, set the container's **Repository** to that tag, for example `ghcr.io/valigha/nexus-archivist:1.4.1`, and apply. Settings, your saved login and the library are not touched. Pin a version tag if you do not want updates.
+
 ## Local
 
 ```bash
