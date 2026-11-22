@@ -125,7 +125,7 @@
     }
     .stats {
       display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
+      grid-template-columns: repeat(6, minmax(0, 1fr));
       gap: 10px;
       margin: 22px 0;
     }
@@ -419,6 +419,8 @@
       * { transition: none !important; }
     }
   
+    .stat small { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; min-height: 16px; }
+    .stat small button { background: none; border: 0; padding: 0; color: var(--accent); font-size: 11px; text-decoration: underline; cursor: pointer; }
     .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
     .grid2 .card { min-height: 0; margin-bottom: 0; }
     @media (max-width: 860px) { .grid2 { display: block; } .grid2 .card { margin-bottom: 14px; } }
@@ -484,7 +486,8 @@
     </div>
 
     <div class="stats">
-      <div class="stat"><span>Library</span><b id="sLibrary">0</b></div>
+      <div class="stat"><span>Library (all books)</span><b id="sLibrary">0</b><small><span id="sLibNote"></span> <button type="button" id="btnRescan">Rescan</button></small></div>
+      <div class="stat"><span>From Nexus</span><b id="sNexus">0</b><small id="sNexusNote">books this tool saved</small></div>
       <div class="stat"><span>Added</span><b id="sAdded">0</b></div>
       <div class="stat"><span>Skipped</span><b id="sSkipped">0</b></div>
       <div class="stat"><span>Failed</span><b id="sFailed">0</b></div>
@@ -874,7 +877,12 @@
         $("badge").className = "badge " + (data.state || "");
         const n = (data.chips || []).length;
         $("tags").textContent = n ? n + " chip" + (n === 1 ? "" : "s") : "No query yet";
-        $("sLibrary").textContent = (data.libraryCount || 0).toLocaleString();
+        $("sLibrary").textContent = (data.libraryTotal || 0).toLocaleString();
+        $("sNexus").textContent = (data.libraryCount || 0).toLocaleString();
+        const other = Math.max(0, (data.libraryTotal || 0) - (data.libraryCount || 0));
+        $("sNexusNote").textContent = other.toLocaleString() + " from other tools";
+        $("sLibNote").textContent = data.libraryScanning ? "scanning…" : (data.libraryScannedAt ? "checked " + ago(data.libraryScannedAt) + " ago" : "");
+        $("btnRescan").disabled = !!data.libraryScanning;
         $("sAdded").textContent = String(data.addedThisCycle ?? 0);
         $("sSkipped").textContent = String(data.skippedThisCycle ?? 0);
         $("sFailed").textContent = String(data.failedThisCycle ?? 0);
@@ -1003,6 +1011,10 @@
       $("delayErr").textContent = "";
       try { await postJSON("/api/settings", { delayMinutes: Number($("delay").value) }); editing.delay = false; }
       catch (e) { $("delayErr").textContent = e.message; }
+    });
+    $("btnRescan").addEventListener("click", () => {
+      hint("Scanning the library…");
+      postJSON("/api/rescan", {}).catch((e) => hint(e.message));
     });
     $("btnWant").addEventListener("click", submitWant);
     $("wantUrl").addEventListener("input", () => { if (data) paintWantCount(); });

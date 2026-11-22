@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.4.1";
+const VERSION = "1.5.0";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -61,7 +61,10 @@ const status = {
   state: "starting",
   paused: false,
   cycle: 0,
-  libraryCount: 0,
+  libraryCount: 0, // books this tool wrote (names with the prefix)
+  libraryTotal: 0, // every .cbz in the library, including other tools' books
+  libraryScanning: false,
+  libraryScannedAt: null,
   addedThisCycle: 0,
   skippedThisCycle: 0,
   failedThisCycle: 0,
@@ -684,11 +687,9 @@ function comicInfo(g) {
 
 const idPattern = new RegExp(`^${cfg.prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\d+)\\b`);
 
-let indexOther = 0; // .cbz files that are not ours (for example folio's), counted but left alone
-
 async function indexLibrary(root) {
   const ids = new Set();
-  indexOther = 0;
+  let other = 0; // .cbz files that are not ours (for example folio's), counted but left alone
   async function scan(dir, depth) {
     let entries;
     try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
@@ -698,26 +699,41 @@ async function indexLibrary(root) {
       else if (entry.isFile() && entry.name.toLowerCase().endsWith(".cbz")) {
         const m = entry.name.match(idPattern);
         if (m) ids.add(Number(m[1]));
-        else indexOther += 1;
+        else other += 1;
       }
     }
   }
   await scan(root, 0);
+  ids.other = other;
   return ids;
 }
 
-// Counts the library once at startup (in the background) so the dashboard is right
-// before anything is started. Large libraries can take a few minutes.
-async function scanLibraryAtBoot() {
+function setLibraryCounts(have) {
+  status.libraryCount = have.size;
+  status.libraryTotal = have.size + (have.other || 0);
+}
+
+let scanBusy = false;
+// Counts the whole library in the background. Large libraries can take a few minutes.
+async function rescanLibrary(why) {
+  if (scanBusy) return;
+  scanBusy = true;
+  status.libraryScanning = true;
   const t0 = Date.now();
-  log("info", `Scanning library ${cfg.library} ...`);
+  if (why !== "periodic") log("info", `Scanning library ${cfg.library} ...`);
   try {
     const have = await indexLibrary(cfg.library);
-    status.libraryCount = have.size;
-    log("info", `Library: ${have.size} ${cfg.prefix ? cfg.prefix + " " : ""}book(s) found in ${((Date.now() - t0) / 1000).toFixed(1)}s; ${indexOther} other .cbz file(s) left alone`);
-    if (!have.size && !indexOther) log("warn", `Nothing found in ${cfg.library}. If your books are elsewhere, change the Library path in the container settings.`);
+    setLibraryCounts(have);
+    status.libraryScannedAt = new Date().toISOString();
+    if (why !== "periodic") {
+      log("info", `Library: ${status.libraryTotal} .cbz in total, ${have.size} ${cfg.prefix ? cfg.prefix + " " : ""}from this tool, ${have.other} from other tools (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+      if (!status.libraryTotal) log("warn", `Nothing found in ${cfg.library}. If your books are elsewhere, change the Library path in the container settings.`);
+    }
   } catch (err) {
     log("warn", `Library scan failed: ${describeError(err)}`);
+  } finally {
+    scanBusy = false;
+    status.libraryScanning = false;
   }
 }
 
@@ -1169,6 +1185,7 @@ async function downloadGallery(id, have, opts = {}) {
     await rename(zipPath, dest);
     have.add(id);
     status.libraryCount = have.size;
+    status.libraryTotal += 1;
     status.addedThisCycle += 1;
     log("info", `Wrote ${dest} (${pages} pages)`);
     pushEvent("wrote", { id, title: filename, pages });
@@ -1304,7 +1321,7 @@ async function runCycle() {
   status.state = "searching";
   const have = await indexLibrary(cfg.library);
   const skip = new Set(await readIds(cfg.dont));
-  status.libraryCount = have.size;
+  setLibraryCounts(have);
   log("info", `Library ${have.size} cbz, ${skip.size} blacklisted`);
   if (wantQueue.length) await drainWant(have, skip);
   const listed = await readIds(cfg.downloadme);
@@ -1529,6 +1546,12 @@ function startServer(port) {
       }).catch((err) => json(res, 400, { error: err.message }));
       return;
     }
+    if (url.pathname === "/api/rescan" && req.method === "POST") {
+      req.resume();
+      if (!scanBusy) rescanLibrary("button");
+      status.libraryScanning = true;
+      return json(res, 200, snapshot());
+    }
     if (url.pathname === "/api/tags") {
       const q = (url.searchParams.get("q") || "").trim().slice(0, 100);
       suggest(q, url.searchParams.get("type") || "all")
@@ -1659,7 +1682,7 @@ async function drainOnly() {
   status.currentTitle = "";
   status.downloadDone = 0;
   status.downloadTotal = 0;
-  status.libraryCount = have.size;
+  setLibraryCounts(have);
   await saveLive();
 }
 
@@ -1688,7 +1711,9 @@ async function main() {
   log("info", `Nexus archivist ${VERSION}. library=${cfg.library} delay=${cfg.delay}ms query=${status.tags || "(none)"}`);
   log("info", `Files are named ${cfg.prefix}<id> <title>.cbz${cfg.prefix ? "" : " (no prefix: do not share this folder with another site's tool)"}`);
   log("info", `login=${session.loggedIn ? `saved session for ${session.user}` : session.expired ? "expired" : "not logged in"} download-delay=${fmtDuration(downloadDelaySec * 1000)} user-agent=${process.env.USER_AGENT ? "custom" : "default"}`);
-  scanLibraryAtBoot();
+  rescanLibrary("boot");
+  // Pick up books other tools add, now and then, without a restart.
+  setInterval(() => { if (!shuttingDown) rescanLibrary("periodic"); }, 60 * 60_000).unref();
   if (skippedFilters.length) log("warn", `Ignored filters the site cannot search: ${[...new Set(skippedFilters)].join(", ")}`);
   log("info", "Stopped. Log in, set a search query, then press Start.");
   status.message = "Stopped. Log in, set a search query, then press Start.";
