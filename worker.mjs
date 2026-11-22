@@ -25,7 +25,7 @@ const ORIGIN = process.env.HN_ORIGIN || "https://hentainexus.com";
 // try IPv4 first because Docker bridge networks usually have no IPv6.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Math.max(250, Number(process.env.CONNECT_TIMEOUT_MS) || 5000));
 dns.setDefaultResultOrder("ipv4first");
-const VERSION = "1.3.3";
+const VERSION = "1.4.0";
 const UNSAFE = /\b(lolicon|loli|shotacon|shota|toddlercon|toddler|preteen|underage|pedo|pedophilia)\b/i;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -40,6 +40,9 @@ const cfg = {
   delay: Math.max(200, Number(process.env.REQUEST_DELAY_MS) || 1500),
   streakCap: Math.max(0, Number(process.env.CATCH_UP_STREAK) || 40),
   maxPerCycle: Math.max(0, Number(process.env.MAX_PER_CYCLE) || 10),
+  // File names start with this prefix so a library shared with another tool
+  // (whose names start with a bare number) never mixes up the two sites' ids.
+  prefix: String(process.env.FILE_PREFIX ?? "HN").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 8),
   zipTimeout: Math.max(60, Number(process.env.ZIP_TIMEOUT_SEC) || 900),
   cooldown: Math.max(1, Number(process.env.ZIP_COOLDOWN_SEC) || 120),
   stall: Math.max(2, Number(process.env.ZIP_STALL_SEC) || 30),
@@ -316,7 +319,7 @@ function libraryDir(id) {
 
 function safeName(id, title) {
   const cleaned = String(title).replace(/[\\/:*?"<>|\t\n]/g, "").replace(/\s+/g, " ").trim();
-  const overhead = `${id} .cbz`.length;
+  const overhead = `${cfg.prefix}${id} .cbz`.length;
   let out = "";
   let bytes = 0;
   for (const ch of cleaned) {
@@ -325,7 +328,7 @@ function safeName(id, title) {
     out += ch;
     bytes += size;
   }
-  return `${id}${out ? ` ${out}` : ""}.cbz`;
+  return `${cfg.prefix}${id}${out ? ` ${out}` : ""}.cbz`;
 }
 
 async function throttleHtml() {
@@ -679,6 +682,8 @@ function comicInfo(g) {
     `  <Manga>YesAndRightToLeft</Manga>\n</ComicInfo>\n`;
 }
 
+const idPattern = new RegExp(`^${cfg.prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\d+)\\b`);
+
 async function indexLibrary(root) {
   const ids = new Set();
   async function scan(dir, depth) {
@@ -688,7 +693,7 @@ async function indexLibrary(root) {
       const full = join(dir, entry.name);
       if (entry.isDirectory() && depth < 2 && !entry.name.startsWith(".tmp-")) await scan(full, depth + 1);
       else if (entry.isFile() && entry.name.toLowerCase().endsWith(".cbz")) {
-        const m = entry.name.match(/^(\d+)\b/);
+        const m = entry.name.match(idPattern);
         if (m) ids.add(Number(m[1]));
       }
     }
@@ -1127,7 +1132,7 @@ async function downloadGallery(id, have, opts = {}) {
     return "wrote";
   }
 
-  const tmp = join(cfg.library, `.tmp-${id}`);
+  const tmp = join(cfg.library, `.tmp-hn-${id}`);
   await rm(tmp, { recursive: true, force: true });
   await mkdir(tmp, { recursive: true });
   try {
@@ -1662,6 +1667,7 @@ async function main() {
   loadSession();
   if (cfg.port) startServer(cfg.port);
   log("info", `Nexus archivist ${VERSION}. library=${cfg.library} delay=${cfg.delay}ms query=${status.tags || "(none)"}`);
+  log("info", `Files are named ${cfg.prefix}<id> <title>.cbz${cfg.prefix ? "" : " (no prefix: do not share this folder with another site's tool)"}`);
   log("info", `login=${session.loggedIn ? `saved session for ${session.user}` : session.expired ? "expired" : "not logged in"} download-delay=${fmtDuration(downloadDelaySec * 1000)} user-agent=${process.env.USER_AGENT ? "custom" : "default"}`);
   if (skippedFilters.length) log("warn", `Ignored filters the site cannot search: ${[...new Set(skippedFilters)].join(", ")}`);
   log("info", "Stopped. Log in, set a search query, then press Start.");
