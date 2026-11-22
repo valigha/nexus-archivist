@@ -39,7 +39,7 @@ In the dashboard, save a search query (for example `artist:"Aomushi"` or `tag:un
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `USER_AGENT` | Chrome | Override the browser User-Agent sent to the site. |
-| `HN_TAGS` | empty | Search query. Empty waits for the dashboard. |
+| `HN_TAGS` | empty | Optional starting filters, space separated (`tag:uncensored -tag:unbirth`). The dashboard chips replace it once saved. The site has no `language:` search. |
 | `SLEEP_INTERVAL` | 3600 | Seconds to wait after a cycle. |
 | `MAX_PER_CYCLE` | 10 | Cap on new CBZs per cycle. 0 = unlimited. |
 | `CATCH_UP_STREAK` | 40 | Stop a cycle after this many already-have galleries in a row. |
